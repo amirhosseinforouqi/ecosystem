@@ -12,7 +12,7 @@ if [ -n "$CODESPACE_NAME" ]; then
   export APP_URL="https://${CODESPACE_NAME}-3000.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}"
 fi
 
-if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+if curl -sf http://127.0.0.1:3000/health > /dev/null 2>&1; then
   echo "Mortgage platform is already running at http://localhost:3000"
   exit 0
 fi
@@ -22,7 +22,7 @@ disown
 
 for i in $(seq 1 20); do
   sleep 0.5
-  if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+  if curl -sf http://127.0.0.1:3000/health > /dev/null 2>&1; then
     echo "Mortgage platform is running. Logs: /tmp/mortgage-platform.log"
     exit 0
   fi

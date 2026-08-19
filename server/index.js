@@ -173,7 +173,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (require.main === module) {
-  server.listen(PORT, () => {
+  // Bind explicitly to all IPv4 interfaces: Node's default (host omitted)
+  // binds IPv6-only, which the Codespaces/devcontainer port-forwarding
+  // proxy cannot reach — that shows up to users as a 502.
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`Mortgage client platform running at http://localhost:${PORT}`);
     console.log(`  Broker portal:  http://localhost:${PORT}/broker`);
     console.log(`  Client portal:  http://localhost:${PORT}/portal`);

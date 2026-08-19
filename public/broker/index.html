@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Broker Portal</title>
+  <link rel="stylesheet" href="/shared.css">
+  <link rel="stylesheet" href="/broker/broker.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="side-brand">
+        <div class="brand-mark" id="brand-mark">M</div>
+        <div class="brand-name" id="brand-name">Broker Portal</div>
+      </div>
+      <nav class="side-nav" aria-label="Main">
+        <a href="#/dashboard" data-nav="dashboard">📋 Dashboard</a>
+        <a href="#/clients" data-nav="clients">👥 Clients</a>
+        <a href="#/tasks" data-nav="tasks">✅ Tasks</a>
+        <a href="#/reports" data-nav="reports">📈 Reports</a>
+        <a href="#/settings" data-nav="settings" id="nav-settings">⚙️ Settings</a>
+      </nav>
+      <div class="side-footer">
+        <div class="small" id="side-user"></div>
+        <button class="btn-link small" id="logout-btn">Sign out</button>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Menu">☰</button>
+        <div class="search-wrap">
+          <input type="search" id="global-search" placeholder="Search clients, files, addresses…" aria-label="Search" autocomplete="off">
+          <div class="search-results hidden" id="search-results"></div>
+        </div>
+        <div class="spacer"></div>
+        <a class="btn sm" href="#/clients/new" id="new-client-btn">+ New client</a>
+        <button class="icon-btn" id="notif-btn" aria-label="Notifications">🔔<span class="badge-dot hidden" id="notif-badge"></span></button>
+      </header>
+      <main id="view" class="content" aria-live="polite"></main>
+    </div>
+  </div>
+
+  <script src="/app-common.js"></script>
+  <script src="/broker/broker-file.js"></script>
+  <script src="/broker/broker-settings.js"></script>
+  <script src="/broker/broker.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "mortgage-client-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A simple, secure mortgage client management platform: broker portal + client portal, document collection, chat, stages, tasks and reminders.",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --watch --disable-warning=ExperimentalWarning server/index.js",
+    "seed:demo": "node --disable-warning=ExperimentalWarning scripts/seed-demo.js",
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.js"
+  }
+}

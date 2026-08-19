@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Client Portal</title>
+  <link rel="stylesheet" href="/shared.css">
+  <link rel="stylesheet" href="/portal/portal.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand-mark" id="brand-mark" aria-hidden="true">M</div>
+      <div class="brand-name" id="brand-name">Client Portal</div>
+      <div class="spacer"></div>
+      <button class="icon-btn" id="nav-notifications" aria-label="Notifications">🔔<span class="badge-dot hidden" id="notif-badge"></span></button>
+      <button class="icon-btn" id="nav-profile" aria-label="Your profile">👤</button>
+    </div>
+  </header>
+
+  <main id="view" class="view" aria-live="polite"></main>
+
+  <nav class="bottom-nav" aria-label="Main">
+    <button data-route="#/home" class="active"><span aria-hidden="true">🏠</span>Home</button>
+    <button data-route="#/documents"><span aria-hidden="true">📄</span>Documents<span class="nav-dot hidden" id="docs-dot"></span></button>
+    <button data-route="#/messages"><span aria-hidden="true">💬</span>Messages<span class="nav-dot hidden" id="msg-dot"></span></button>
+  </nav>
+
+  <script src="/app-common.js"></script>
+  <script src="/portal/portal.js"></script>
+</body>
+</html>

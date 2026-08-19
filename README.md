@@ -11,6 +11,36 @@ documents from their phone → the broker reviews, communicates and moves the
 file through stages → the platform reminds the right person when something
 needs attention.
 
+## Demo it in GitHub Codespaces
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/amirhosseinforouqi/ecosystem/tree/claude/mortgage-client-platform-xsxg4g)
+
+No local setup needed. Click the badge (or, on this branch, use the **Code**
+button → **Codespaces** tab → **Create codespace on branch**) and the
+container will:
+
+1. Install nothing extra — the platform has zero runtime dependencies.
+2. Seed demo data automatically (`.devcontainer/postCreateCommand`) — three
+   sample clients in different stages, ready to explore.
+3. Start the server in the background and forward port 3000, opening a
+   preview automatically.
+
+Once it's up, sign in with:
+
+| Portal | URL | Email | Password |
+|---|---|---|---|
+| Broker | `/broker` | `admin@example.com` | `admin1234` |
+| Client | `/portal` | `john.demo@example.com` | `Demo1234pass` |
+
+(Two more demo clients — `sarah.demo@example.com` and `david.demo@example.com`,
+same password — show a couple's refinance and a completed-checklist file
+submitted to the lender.)
+
+If the preview doesn't open automatically, check the **Ports** tab in the
+Codespace for the forwarded `3000` URL, or run `bash .devcontainer/start.sh`
+in the terminal. Since this branch hasn't been merged yet, Codespaces must be
+created from the branch directly (the link above does that).
+
 ## Quick start
 
 Requires **Node.js 22.5+**. There are **zero runtime dependencies** — nothing

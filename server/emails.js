@@ -2,13 +2,13 @@
 
 const { run, get, getSetting } = require('./db');
 const { now } = require('./util');
+const smtp = require('./smtp');
 
 /**
  * Email delivery is an outbox: every email is rendered from a template and
  * recorded in email_log first (the portal is the source of truth; email is a
  * notification layer). Delivery happens through a pluggable transport so a
- * real provider (SMTP relay, Gmail / Microsoft 365 API, SES...) can be wired
- * in without touching any calling code.
+ * real provider can be wired in without touching any calling code.
  */
 
 const transports = {
@@ -21,6 +21,33 @@ const transports = {
   },
   /** No-op transport: emails stay recorded but are never delivered. */
   disabled: async () => ({ ok: true, skipped: true }),
+  /**
+   * Sends through a real mailbox via SMTP (Gmail, Outlook/Microsoft 365, or
+   * any SMTP-AUTH provider). Configured entirely by environment variables —
+   * see README "Connect a real email account".
+   */
+  smtp: async (email) => {
+    const host = process.env.SMTP_HOST;
+    const user = process.env.SMTP_USER;
+    const pass = process.env.SMTP_PASS;
+    if (!host || !user || !pass) {
+      throw new Error('SMTP is not fully configured — set SMTP_HOST, SMTP_USER and SMTP_PASS.');
+    }
+    await smtp.sendMail({
+      host,
+      port: Number(process.env.SMTP_PORT) || 587,
+      secure: process.env.SMTP_SECURE === 'true' ? true : process.env.SMTP_SECURE === 'false' ? false : undefined,
+      user,
+      pass,
+      from: process.env.SMTP_FROM || user,
+      fromName: process.env.SMTP_FROM_NAME || undefined,
+      to: email.to_email,
+      toName: email.to_name,
+      subject: email.subject,
+      text: email.body,
+    });
+    return { ok: true };
+  },
 };
 
 function activeTransport() {

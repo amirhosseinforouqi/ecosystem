@@ -74,8 +74,48 @@ On first start an admin account is created and printed to the console
 
 Configuration is via environment variables: `PORT`, `DATA_DIR` (database +
 uploads location, default `./data`), `APP_URL` (public URL used in email
-links), `EMAIL_TRANSPORT` (`log` | `disabled`), `FORCE_SECURE_COOKIES=1`
+links), `EMAIL_TRANSPORT` (`log` | `disabled` | `smtp`), `FORCE_SECURE_COOKIES=1`
 (behind HTTPS termination that doesn't set `x-forwarded-proto`).
+
+## Connect a real email account
+
+By default, emails aren't actually delivered — every one is still rendered
+and recorded (Settings → Email templates / a file's Emails tab), just not
+sent, so you can develop and demo without spamming anyone. To have the
+platform send real email through a mailbox you already own — Gmail or
+Outlook/Microsoft 365 both work, for free, no third-party service needed —
+set `EMAIL_TRANSPORT=smtp` plus:
+
+| Variable | Example | Notes |
+|---|---|---|
+| `SMTP_HOST` | `smtp.gmail.com` | see provider table below |
+| `SMTP_PORT` | `587` | 587 = STARTTLS (typical), 465 = implicit TLS |
+| `SMTP_USER` | `you@gmail.com` | your full email address |
+| `SMTP_PASS` | `abcd efgh ijkl mnop` | an **app password**, not your normal login password |
+| `SMTP_FROM` | `you@gmail.com` | optional, defaults to `SMTP_USER` |
+| `SMTP_FROM_NAME` | `Jane Broker` | optional display name |
+
+**Getting an app password (free, ~2 minutes):**
+
+- **Gmail** — turn on 2-Step Verification at [myaccount.google.com/security](https://myaccount.google.com/security), then go to **App passwords**, create one for "Mail", and use the 16-character code as `SMTP_PASS`. Host: `smtp.gmail.com`, port `587`.
+- **Outlook / Microsoft 365** — turn on 2-step verification at [account.microsoft.com/security](https://account.microsoft.com/security), then **Create a new app password** and use it as `SMTP_PASS`. Host: `smtp.office365.com` (work/school account) or `smtp-mail.outlook.com` (personal outlook.com/hotmail.com), port `587`.
+
+**In a Codespace**, don't type the password into the terminal each session —
+store it once as a [Codespaces secret](https://github.com/settings/codespaces)
+(`SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, and set `EMAIL_TRANSPORT=smtp`) and it's
+injected automatically into every future codespace on this repo.
+
+**Test it** without touching the app's data:
+
+```bash
+npm run test:email -- you@example.com
+```
+
+This sends one real email using your configured account so you can confirm
+it works before creating any clients. Delivery uses a small zero-dependency
+SMTP client built on Node's own `net`/`tls` modules (`server/smtp.js`) — no
+external mail package, and it's covered by `npm test` against a real
+STARTTLS conversation, not a stub.
 
 ## The two experiences
 

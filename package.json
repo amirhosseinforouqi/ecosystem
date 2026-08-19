@@ -12,6 +12,7 @@
     "dev": "node --watch --disable-warning=ExperimentalWarning server/index.js",
     "seed:demo": "node --disable-warning=ExperimentalWarning scripts/seed-demo.js",
     "reset:broker-only": "node --disable-warning=ExperimentalWarning scripts/reset-broker-only.js",
+    "test:email": "node --disable-warning=ExperimentalWarning scripts/send-test-email.js",
     "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.js"
   }
 }

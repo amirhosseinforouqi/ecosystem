@@ -41,6 +41,19 @@ Codespace for the forwarded `3000` URL, or run `bash .devcontainer/start.sh`
 in the terminal. Since this branch hasn't been merged yet, Codespaces must be
 created from the branch directly (the link above does that).
 
+**Want a blank slate instead** — e.g. to walk someone through the "create a
+client" flow step by step from an empty dashboard? In the Codespace terminal:
+
+```bash
+npm run reset:broker-only   # wipes local data, leaves just the broker account
+pkill -f "node.*server/index.js"
+bash .devcontainer/start.sh
+```
+
+Then sign in to `/broker` as `admin@example.com` / `admin1234` — zero clients,
+ready for a live walkthrough. Run `npm run seed:demo` (after stopping the
+server) any time to bring the three sample clients back.
+
 ## Quick start
 
 Requires **Node.js 22.5+**. There are **zero runtime dependencies** — nothing
@@ -48,7 +61,8 @@ to install.
 
 ```bash
 npm start                 # start the platform on http://localhost:3000
-npm run seed:demo         # optional: seed demo clients to explore with
+npm run seed:demo         # optional: seed 3 demo clients to explore with
+npm run reset:broker-only # optional: wipe data, leave just the broker account
 npm test                  # run the end-to-end scenario tests
 ```
 

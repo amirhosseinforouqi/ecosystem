@@ -12,7 +12,6 @@
  * generated randomly and printed once.
  */
 
-const crypto = require('node:crypto');
 const demo = require('./demo-lib');
 
 process.env.NODE_ENV = process.env.NODE_ENV || 'development';
@@ -40,7 +39,7 @@ async function main() {
 
   console.log('Seeding demo data…');
   const clientPassword = process.env.DEMO_CLIENT_PASSWORD
-    || `Portal-${crypto.randomBytes(9).toString('base64url')}`;
+    || `Portal-${require('../server/auth').generateTemporaryPassword()}`;
   /**
    * Take a freshly created portal account through its first sign-in: the
    * temporary password is single-use, exactly as it is for a real client.

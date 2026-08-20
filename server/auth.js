@@ -43,14 +43,25 @@ async function verifyPassword(password, stored) {
 }
 
 /**
- * Temporary password: 12 characters from a 56-symbol alphabet chosen without
- * modulo bias (crypto.randomInt rejects out-of-range draws internally), with
- * visually ambiguous characters excluded so it can be read aloud or retyped.
+ * Generate a password that is guaranteed to satisfy the password policy.
+ *
+ * Characters are drawn without modulo bias (crypto.randomInt rejects
+ * out-of-range draws internally) from an alphabet with the visually ambiguous
+ * symbols removed, so the result can be read aloud or retyped from an email.
+ *
+ * The two trailing checks are not decoration. The policy requires a letter
+ * *and* a digit, and a random draw over any alphabet produces an all-letter
+ * string often enough to matter — a plain 12-character base64 string has no
+ * digit about one time in eight. Every generated password in this codebase
+ * comes from here so that no caller has to remember that.
+ *
+ * @param {number} groups four-character groups; 3 → 12 characters.
  */
-function generateTemporaryPassword() {
+function generateTemporaryPassword(groups = 3) {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const length = Math.max(1, Math.trunc(groups)) * 4;
   let out = '';
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < length; i++) {
     if (i > 0 && i % 4 === 0) out += '-';
     out += alphabet[crypto.randomInt(0, alphabet.length)];
   }

@@ -401,6 +401,35 @@ describe('credentials (audit findings C4, M1)', () => {
     }
   });
 
+  test('every password the platform generates satisfies its own policy', async () => {
+    // A demo script that fails one run in eight is worse than one that never
+    // works: the failure looks like flakiness rather than a bug. Randomly
+    // generated passwords must therefore be *guaranteed* to pass the policy,
+    // not merely likely to — a plain base64 string has no digit about 13% of
+    // the time, and the policy requires a letter and a digit.
+    const { generateTemporaryPassword, validatePasswordStrength } = require('../server/auth');
+    for (let i = 0; i < 500; i++) {
+      const password = generateTemporaryPassword();
+      await assert.doesNotReject(
+        () => validatePasswordStrength(password, { role: 'client' }),
+        `client policy rejected a generated password: ${password}`
+      );
+    }
+    for (let i = 0; i < 200; i++) {
+      const password = generateTemporaryPassword(4);
+      await assert.doesNotReject(
+        () => validatePasswordStrength(password, { role: 'admin' }),
+        `staff policy rejected a generated password: ${password}`
+      );
+    }
+  });
+
+  test('a generated password is long enough for the stricter staff minimum', async () => {
+    const { generateTemporaryPassword } = require('../server/auth');
+    assert.ok(generateTemporaryPassword().replace(/-/g, '').length >= 10, 'client minimum');
+    assert.ok(generateTemporaryPassword(4).replace(/-/g, '').length >= 12, 'staff minimum');
+  });
+
   test('a weak new password is rejected with a helpful reason', async () => {
     const res = await alice.post('/api/auth/change-password', {
       current_password: 'Willow-Harbour-Signal-12',

@@ -76,7 +76,6 @@ function makeClient(base) {
  */
 async function signInAdmin(base, { quiet = false } = {}) {
   const mfa = require('../server/mfa');
-  const crypto = require('node:crypto');
   const client = makeClient(base);
 
   const email = process.env.ADMIN_EMAIL;
@@ -98,7 +97,7 @@ async function signInAdmin(base, { quiet = false } = {}) {
     // A bootstrap password is single-use by design; pick a strong one and
     // print it so the operator can actually sign in afterwards.
     finalPassword = process.env.DEMO_ADMIN_PASSWORD
-      || `Demo-${crypto.randomBytes(9).toString('base64url')}`;
+      || `Demo-${require('../server/auth').generateTemporaryPassword()}`;
     res = await client.post('/api/auth/change-password', {
       current_password: password, new_password: finalPassword,
     });

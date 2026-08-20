@@ -2,14 +2,17 @@
 # Runs every time the codespace/container starts: launches the server in the
 # background if it isn't already running. Idempotent, so re-attaching a
 # running codespace never double-starts it.
-set -euo pipefail
+set -uo pipefail
 cd "$(dirname "$0")/.."
 
 ENV_FILE=".devcontainer/.env.local"
-if [ -f "$ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
+if [ ! -f "$ENV_FILE" ]; then
+  echo "$ENV_FILE is missing — container setup did not finish."
+  echo "Run: bash .devcontainer/setup.sh"
+  exit 1
 fi
+# shellcheck disable=SC1090
+source "$ENV_FILE"
 
 # Inside a Codespace, port 3000 is reachable at a *-3000.app.github.dev host,
 # not localhost — point activation/reset links there so they actually work
@@ -26,13 +29,26 @@ fi
 nohup npm start > /tmp/mortgage-platform.log 2>&1 &
 disown
 
-for _ in $(seq 1 40); do
+for _ in $(seq 1 60); do
   sleep 0.5
   if curl -sf http://127.0.0.1:3000/ready > /dev/null 2>&1; then
-    echo "Mortgage platform is running. Logs: /tmp/mortgage-platform.log"
-    echo "Sign-in details are in .devcontainer/.env.local (ADMIN_EMAIL / ADMIN_PASSWORD)."
+    echo "----------------------------------------------------------"
+    echo "Mortgage platform is running on port 3000."
+    echo "  Broker portal:  /broker"
+    echo "  Client portal:  /portal"
+    echo "  Email:    ${ADMIN_EMAIL}"
+    echo "  Password: ${ADMIN_PASSWORD}"
+    echo "Logs: /tmp/mortgage-platform.log"
+    echo "----------------------------------------------------------"
     exit 0
   fi
 done
 
-echo "Server did not come up in time — check /tmp/mortgage-platform.log"
+# Never leave the operator staring at a 502 with no explanation.
+echo "----------------------------------------------------------"
+echo "The server did not come up. The last lines of its log:"
+echo "----------------------------------------------------------"
+tail -30 /tmp/mortgage-platform.log
+echo "----------------------------------------------------------"
+echo "Fix the cause above, then run: bash .devcontainer/start.sh"
+exit 1

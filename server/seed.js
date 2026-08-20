@@ -530,7 +530,7 @@ async function seedIfNeeded() {
 async function bootstrapAdmin() {
   if (await get("SELECT id FROM users WHERE role <> 'client' LIMIT 1")) return null;
 
-  const { hashPassword, validatePasswordStrength } = require('./auth');
+  const { hashPassword, validatePasswordStrength, generateTemporaryPassword } = require('./auth');
   const email = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
   if (!email) {
     throw new Error(
@@ -546,7 +546,7 @@ async function bootstrapAdmin() {
     // staff password — no weak value can enter the system this way.
     await validatePasswordStrength(password, { role: 'admin', user: { email } });
   } else {
-    password = require('node:crypto').randomBytes(24).toString('base64url');
+    password = generateTemporaryPassword(6);
     generated = true;
   }
 

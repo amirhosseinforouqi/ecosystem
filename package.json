@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node server/index.js",
     "doctor": "node scripts/doctor.js",
+    "code": "node scripts/code.js",
     "dev": "node --watch server/index.js",
     "migrate": "node scripts/migrate.js",
     "keygen": "node scripts/keygen.js",

@@ -58,6 +58,10 @@ for _ in $(seq 1 60); do
     echo "  Client portal:  /portal"
     echo "  Email:    ${ADMIN_EMAIL}"
     echo "  Password: ${ADMIN_PASSWORD}"
+    echo ""
+    echo "  Administrators need a two-step code. No phone required here:"
+    echo "    npm run code        # prints the current 6-digit code"
+    echo ""
     echo "Logs: $LOG   ·   Diagnose: npm run doctor"
     echo "----------------------------------------------------------"
     exit 0

@@ -32,10 +32,23 @@ demo seeder prints the client portal password once:
 cat .devcontainer/.env.local          # ADMIN_EMAIL / ADMIN_PASSWORD
 ```
 
-Administrators must also complete two-step verification at first sign-in. The
-setup screen shows a key to type into any authenticator app (Microsoft
-Authenticator, Google Authenticator, 1Password…), and the seeder prints an
-`otpauth://` link you can open on your phone.
+### Signing in without a phone
+
+Administrators must complete two-step verification — that control is not
+disabled for the demo. But you do not need an authenticator app to try it:
+
+```bash
+npm run code        # prints the current 6-digit code
+```
+
+The code is derived from the secret already in the database, so this only works
+for someone who can already run commands on the server, and it refuses to run
+with `NODE_ENV=production`. Real staff use an authenticator app; the setup
+screen shows a key to type in, and the seeder prints an `otpauth://` link you
+can open on your phone.
+
+**Just want a quick look?** The client portal has no second step. Sign in as
+`john.demo@example.com` with the password the seeder printed.
 
 If the preview doesn't open automatically, check the **PORTS** tab at the
 bottom of the editor and click the globe icon next to port 3000.
@@ -105,6 +118,7 @@ npm run backup                    # database rows + encrypted documents
 npm run restore -- <dir> --confirm
 npm run jobs                      # run the background passes once
 npm run doctor                    # diagnose a setup that isn't working
+npm run code                      # current two-step code, no phone needed
 ```
 
 `npm test` creates and drops its own databases; point `TEST_DATABASE_URL` at a

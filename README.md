@@ -1,4 +1,4 @@
-# Mortgage Client Platform
+# Mortgage Client Platform.
 
 A simple, secure mortgage client management platform for a brokerage — a digital
 mortgage assistant, not a heavyweight CRM. It manages every client from first

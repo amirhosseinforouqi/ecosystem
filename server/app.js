@@ -341,7 +341,12 @@ async function handle(req, res) {
   } catch (err) {
     if (err instanceof ApiError) {
       const headers = err.retryAfter ? { 'Retry-After': String(err.retryAfter) } : {};
+      // When we stopped reading a request body early (an over-size upload),
+      // the rest of it is still in flight. Answer first, then close, so the
+      // caller sees the explanation rather than a reset connection.
+      if (err.closeConnection) headers.Connection = 'close';
       sendJson(res, err.status, { ok: false, code: err.code, message: err.message }, headers);
+      if (err.closeConnection) res.socket && res.socket.end();
       return;
     }
     // Unexpected: log server-side, report to Sentry, and tell the user

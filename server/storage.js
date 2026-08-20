@@ -143,20 +143,26 @@ function readCapped(req, maxBytes) {
     const chunks = [];
     let size = 0;
     let settled = false;
-    const fail = (err) => {
+    const fail = (err, { destroy = true } = {}) => {
       if (settled) return;
       settled = true;
-      req.destroy();
+      if (destroy) req.destroy();
       reject(err);
     };
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > maxBytes) {
-        return fail(new ApiError(
+        // Stop reading, but leave the socket alive long enough to answer.
+        // Destroying it here would leave the client with a network error
+        // instead of being told, plainly, that the file is too big.
+        req.pause();
+        const err = new ApiError(
           413,
           `That file is too large. The limit is ${Math.round(maxBytes / 1024 / 1024)} MB.`,
           'too_large'
-        ));
+        );
+        err.closeConnection = true;
+        return fail(err, { destroy: false });
       }
       chunks.push(chunk);
     });

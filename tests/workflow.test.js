@@ -149,6 +149,19 @@ describe('scenario 4 — the client uploads', () => {
     assert.equal(res.status, 400);
   });
 
+  test('an over-size upload is told why, not dropped', async () => {
+    // The limit has to be enforced while the body is still arriving, so the
+    // easy mistake is to kill the socket and leave the client with a network
+    // error instead of an explanation.
+    const limits = await require('../server/storage').uploadLimits();
+    const tooBig = Buffer.alloc(limits.maxBytes + 1024, 0x41);
+    tooBig.write('%PDF-1.4\n');
+    const res = await client.upload(`/api/client/requests/${requestIds[0]}/upload`, tooBig, 'huge.pdf');
+    assert.equal(res.status, 413);
+    assert.equal(res.data.code, 'too_large');
+    assert.match(res.data.message, /too large/i);
+  });
+
   test('a file whose contents do not match its extension is refused', async () => {
     const res = await client.upload(
       `/api/client/requests/${requestIds[0]}/upload`,

@@ -19,6 +19,12 @@
   },
   "postCreateCommand": "bash .devcontainer/setup.sh",
   "postStartCommand": "bash .devcontainer/start.sh",
+  // Also start on attach. postStartCommand runs once when the container
+  // starts, and anything it leaves behind can be cleaned up with it; running
+  // again when someone opens the codespace makes the app present whenever a
+  // person is actually looking at it. start.sh exits immediately if the
+  // server is already up, so this is free.
+  "postAttachCommand": "bash .devcontainer/start.sh",
   "customizations": {
     "vscode": {
       "extensions": ["dbaeumer.vscode-eslint"],

@@ -46,9 +46,18 @@ the browser is not signed in to that codespace. In the **PORTS** tab,
 right-click port 3000 → **Port Visibility** → **Public**. (New codespaces set
 this automatically; older ones need it once.)
 
-**Seeing `HTTP ERROR 502`?** Nothing is listening yet. Run
-`bash .devcontainer/start.sh` — it prints the server log if the port does not
-come up.
+**Anything else not working?** One command diagnoses the whole setup and names
+the next thing to run:
+
+```bash
+npm run doctor
+```
+
+It checks the secrets file, every required variable, the database connection,
+the schema, the administrator account and whether the port is actually being
+served — then prints the first thing that is wrong and the command that fixes
+it. `HTTP ERROR 502` means nothing is listening; `npm run doctor` will say why,
+and `bash .devcontainer/start.sh` starts it.
 
 **Want a blank slate** — to walk someone through the "create a client" flow from
 an empty dashboard?
@@ -95,6 +104,7 @@ npm run reset:broker-only -- --confirm
 npm run backup                    # database rows + encrypted documents
 npm run restore -- <dir> --confirm
 npm run jobs                      # run the background passes once
+npm run doctor                    # diagnose a setup that isn't working
 ```
 
 `npm test` creates and drops its own databases; point `TEST_DATABASE_URL` at a

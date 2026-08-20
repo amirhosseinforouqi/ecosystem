@@ -26,19 +26,39 @@ if curl -sf http://127.0.0.1:3000/health > /dev/null 2>&1; then
   exit 0
 fi
 
-nohup npm start > /tmp/mortgage-platform.log 2>&1 &
-disown
+# Detach into a new session, not just the background.
+#
+# postStartCommand's process tree is cleaned up when the command returns, and
+# a plain "&" leaves the server in that tree — so it starts, reports healthy,
+# and is then killed the moment this script exits. The symptom is a forwarded
+# port with no running process behind it and a log that claims success.
+# setsid moves it out of that tree entirely.
+LOG=/tmp/mortgage-platform.log
+if command -v setsid > /dev/null 2>&1; then
+  setsid nohup npm start > "$LOG" 2>&1 < /dev/null &
+else
+  nohup npm start > "$LOG" 2>&1 < /dev/null &
+fi
+disown 2>/dev/null || true
 
 for _ in $(seq 1 60); do
   sleep 0.5
   if curl -sf http://127.0.0.1:3000/ready > /dev/null 2>&1; then
+    # Confirm it is still up a moment later. A server that answers once and
+    # then disappears is the failure this whole block exists to catch.
+    sleep 2
+    if ! curl -sf http://127.0.0.1:3000/ready > /dev/null 2>&1; then
+      echo "The server started and then exited. Its log:"
+      tail -30 "$LOG"
+      exit 1
+    fi
     echo "----------------------------------------------------------"
     echo "Mortgage platform is running on port 3000."
     echo "  Broker portal:  /broker"
     echo "  Client portal:  /portal"
     echo "  Email:    ${ADMIN_EMAIL}"
     echo "  Password: ${ADMIN_PASSWORD}"
-    echo "Logs: /tmp/mortgage-platform.log"
+    echo "Logs: $LOG   ·   Diagnose: npm run doctor"
     echo "----------------------------------------------------------"
     exit 0
   fi
@@ -48,7 +68,7 @@ done
 echo "----------------------------------------------------------"
 echo "The server did not come up. The last lines of its log:"
 echo "----------------------------------------------------------"
-tail -30 /tmp/mortgage-platform.log
+tail -30 "$LOG"
 echo "----------------------------------------------------------"
 echo "Fix the cause above, then run: bash .devcontainer/start.sh"
 exit 1

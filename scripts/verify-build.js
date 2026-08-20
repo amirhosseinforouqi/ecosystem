@@ -40,6 +40,7 @@ if (failed) process.exit(1);
 
 const REQUIRED = [
   'DATABASE_URL',
+  'STORAGE_BACKEND',
   'DOCUMENT_ENCRYPTION_KEYS',
   'DOCUMENT_ENCRYPTION_ACTIVE_KEY',
   'APP_URL',

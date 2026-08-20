@@ -24,8 +24,6 @@
  * confirm each one against your backups before removing it by hand.
  */
 
-const fsp = require('node:fs/promises');
-const path = require('node:path');
 const db = require('../server/db');
 const storage = require('../server/storage');
 const cryptoStore = require('../server/crypto-store');
@@ -38,19 +36,10 @@ const orphansOnly = process.argv.includes('--orphans');
 async function listOrphans() {
   const rows = await db.all('SELECT stored_name FROM document_versions');
   const referenced = new Set(rows.map((r) => r.stored_name));
-  let names = [];
-  try {
-    names = await fsp.readdir(storage.UPLOAD_DIR);
-  } catch {
-    console.log('No upload directory yet.');
-    return;
-  }
+  const names = await storage.listStored();
   const orphans = names.filter((n) => !referenced.has(n));
   console.log(`${names.length} blobs on disk, ${referenced.size} referenced, ${orphans.length} orphaned.`);
-  for (const name of orphans) {
-    const stat = await fsp.stat(path.join(storage.UPLOAD_DIR, name)).catch(() => null);
-    console.log(`  ${name}  ${stat ? `${stat.size} B  ${stat.mtime.toISOString()}` : '(unreadable)'}`);
-  }
+  for (const name of orphans) console.log(`  ${name}`);
   if (orphans.length) {
     console.log('\nNothing has been deleted. Check these against your backups before removing them.');
   }
@@ -84,12 +73,10 @@ async function main() {
     try {
       const bytes = await storage.readStored(version.stored_name, envelope);
       const { ciphertext, envelope: fresh } = cryptoStore.encryptBuffer(bytes);
-      // Write beside the original and swap, so a crash mid-write cannot leave
-      // a document that is neither the old ciphertext nor the new one.
-      const target = storage.storedPath(version.stored_name);
-      const temp = `${target}.rewrap`;
-      await fsp.writeFile(temp, ciphertext, { mode: 0o600 });
-      await fsp.rename(temp, target);
+      // Write the new ciphertext first and only then point the row at the new
+      // envelope, so an interrupted run leaves a readable document either way.
+      await storage.removeStored(version.stored_name);
+      await storage.writeRaw(version.stored_name, ciphertext);
       await db.run('UPDATE document_versions SET enc_envelope = ? WHERE id = ?', JSON.stringify(fresh), version.id);
       changed += 1;
     } catch (err) {

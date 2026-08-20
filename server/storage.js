@@ -8,23 +8,88 @@
  * The envelope metadata travels in the database row, so key rotation is a
  * config change rather than a data migration.
  *
- * The local driver keeps the working copy the app serves for preview and AI
- * review; OneDrive holds the brokerage's own copy. Files are never served
- * statically and never live under the web root.
+ * Two backends, chosen by STORAGE_BACKEND:
+ *
+ *   local (default) — a directory under DATA_DIR. Right for a long-running
+ *                     server with a persistent volume.
+ *   s3              — any S3-compatible object store (Supabase Storage, R2,
+ *                     MinIO, S3). Required on serverless platforms, whose
+ *                     filesystem is empty again on the next request.
+ *
+ * Either way the bytes are already ciphertext by the time they are written,
+ * so the store never holds a readable client document. OneDrive holds the
+ * brokerage's own copy separately. Files are never served statically and
+ * never live under the web root.
  */
 
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { pipeline } = require('node:stream/promises');
 const { getSetting } = require('./db');
 const { ApiError } = require('./util');
 const cryptoStore = require('./crypto-store');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+function backend() {
+  const explicit = (process.env.STORAGE_BACKEND || '').toLowerCase();
+  if (explicit) return explicit;
+  // Convenience: configuring a bucket is unambiguous intent.
+  return process.env.S3_BUCKET ? 's3' : 'local';
+}
+
+function usingObjectStore() {
+  return backend() === 's3';
+}
+
+if (!usingObjectStore()) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+/**
+ * Refuse to run on an ephemeral filesystem with the local backend.
+ *
+ * On Vercel and similar platforms a document written to disk is gone by the
+ * next request. Failing at boot is far better than discovering it when a
+ * client's payslip cannot be found.
+ */
+function assertBackendUsable() {
+  if (usingObjectStore()) {
+    require('./objectstore').assertConfigured();
+    return;
+  }
+  const serverless = process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.FUNCTIONS_WORKER_RUNTIME;
+  if (serverless && process.env.ALLOW_EPHEMERAL_STORAGE !== '1') {
+    throw new Error(
+      'This platform has an ephemeral filesystem, so documents written locally would be lost. ' +
+      'Set STORAGE_BACKEND=s3 with S3_ENDPOINT/S3_BUCKET/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY ' +
+      '(Supabase Storage, R2, MinIO or S3), or set ALLOW_EPHEMERAL_STORAGE=1 if you genuinely ' +
+      'have a persistent volume mounted at DATA_DIR.'
+    );
+  }
+}
+
+/** Write the raw (already encrypted) bytes for a stored name. */
+async function writeRaw(storedName, bytes) {
+  if (usingObjectStore()) {
+    await require('./objectstore').putObject(storedName, bytes);
+    return;
+  }
+  await fsp.mkdir(UPLOAD_DIR, { recursive: true, mode: 0o700 });
+  await fsp.writeFile(storedPath(storedName), bytes, { flag: 'wx', mode: 0o600 });
+}
+
+/** Read the raw (still encrypted) bytes, or null when there is nothing there. */
+async function readRaw(storedName) {
+  if (usingObjectStore()) {
+    return require('./objectstore').getObject(storedName);
+  }
+  try {
+    return await fsp.readFile(storedPath(storedName));
+  } catch {
+    return null;
+  }
+}
 
 const MIME_BY_EXT = {
   pdf: 'application/pdf',
@@ -126,7 +191,7 @@ async function saveRequestBody(req, filename) {
 
   const { ciphertext, envelope } = cryptoStore.encryptBuffer(plaintext);
   const storedName = `${crypto.randomBytes(16).toString('hex')}.${ext}.enc`;
-  await fsp.writeFile(storedPath(storedName), ciphertext, { flag: 'wx', mode: 0o600 });
+  await writeRaw(storedName, ciphertext);
 
   return {
     storedName,
@@ -178,11 +243,8 @@ function readCapped(req, maxBytes) {
 
 /** Decrypt and return a stored document's bytes. */
 async function readStored(storedName, envelope) {
-  const p = storedPath(storedName);
-  let ciphertext;
-  try {
-    ciphertext = await fsp.readFile(p);
-  } catch {
+  const ciphertext = await readRaw(storedName);
+  if (ciphertext === null) {
     throw new ApiError(404, 'That file is no longer available.', 'not_found');
   }
   if (!envelope) {
@@ -192,12 +254,15 @@ async function readStored(storedName, envelope) {
   }
   try {
     return cryptoStore.decryptBuffer(ciphertext, envelope);
-  } catch (err) {
+  } catch {
     throw new ApiError(500, 'That document could not be decrypted. Contact your administrator.', 'decrypt_failed');
   }
 }
 
 async function removeStored(storedName) {
+  if (usingObjectStore()) {
+    try { return await require('./objectstore').deleteObject(storedName); } catch { return false; }
+  }
   try {
     await fsp.rm(storedPath(storedName), { force: true });
     return true;
@@ -207,6 +272,9 @@ async function removeStored(storedName) {
 }
 
 async function storedExists(storedName) {
+  if (usingObjectStore()) {
+    try { return !!(await require('./objectstore').headObject(storedName)); } catch { return false; }
+  }
   try {
     await fsp.access(storedPath(storedName));
     return true;
@@ -215,8 +283,27 @@ async function storedExists(storedName) {
   }
 }
 
-/** Total bytes currently held on the local volume, for quota checks. */
+/** Every stored name the backend currently holds, for orphan reporting. */
+async function listStored() {
+  if (usingObjectStore()) {
+    return (await require('./objectstore').listObjects()).map((o) => o.key);
+  }
+  try {
+    return await fsp.readdir(UPLOAD_DIR);
+  } catch {
+    return [];
+  }
+}
+
+/** Total bytes currently held, for quota checks. */
 async function usageBytes() {
+  if (usingObjectStore()) {
+    try {
+      return (await require('./objectstore').listObjects()).reduce((n, o) => n + o.size, 0);
+    } catch {
+      return 0;
+    }
+  }
   let total = 0;
   try {
     for (const name of await fsp.readdir(UPLOAD_DIR)) {
@@ -230,6 +317,12 @@ async function usageBytes() {
 module.exports = {
   saveRequestBody,
   readStored,
+  readRaw,
+  writeRaw,
+  listStored,
+  backend,
+  usingObjectStore,
+  assertBackendUsable,
   removeStored,
   storedExists,
   storedPath,

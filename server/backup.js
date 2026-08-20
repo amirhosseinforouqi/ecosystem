@@ -126,15 +126,16 @@ async function createBackup(destRoot, opts = {}) {
   if (includeDocuments) {
     const versions = await db.all('SELECT stored_name FROM document_versions');
     for (const v of versions) {
-      const src = storage.storedPath(v.stored_name);
-      try {
-        const bytes = await fsp.readFile(src);
-        await fsp.writeFile(path.join(dir, 'documents', v.stored_name), bytes, { mode: 0o600 });
-        documents += 1;
-        documentBytes += bytes.length;
-      } catch {
+      // Read through the storage layer, so a backup works the same whether
+      // documents live on a volume or in an object store.
+      const bytes = await storage.readRaw(v.stored_name).catch(() => null);
+      if (!bytes) {
         missing.push(v.stored_name);
+        continue;
       }
+      await fsp.writeFile(path.join(dir, 'documents', v.stored_name), bytes, { mode: 0o600 });
+      documents += 1;
+      documentBytes += bytes.length;
     }
   }
 
@@ -288,10 +289,11 @@ async function restoreBackup(dir, { confirm = false, restoreDocuments = true } =
   if (restoreDocuments) {
     const docDir = path.join(dir, 'documents');
     if (fs.existsSync(docDir)) {
-      await fsp.mkdir(storage.UPLOAD_DIR, { recursive: true, mode: 0o700 });
       for (const name of await fsp.readdir(docDir)) {
         const bytes = await fsp.readFile(path.join(docDir, name));
-        await fsp.writeFile(storage.storedPath(name), bytes, { mode: 0o600 });
+        // Overwrite whatever is there: a restore is authoritative.
+        await storage.removeStored(name);
+        await storage.writeRaw(name, bytes);
         documents += 1;
       }
     }

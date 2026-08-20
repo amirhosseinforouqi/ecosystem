@@ -242,7 +242,8 @@ checklist items and the broker can always reclassify.
   a proxy is actually there.
 - **Documents encrypted at rest** — AES-256-GCM envelope encryption with
   rotatable keys. Without keys the application refuses uploads rather than
-  silently storing plaintext. Backups carry the same encryption.
+  silently storing plaintext. Backups carry the same encryption, and so does
+  the object store when documents live in a bucket.
 - **Malware scanning** — uploads are scanned (ClamAV) and their bytes are not
   served until they are clean. Production refuses to start without either a
   scanner or an explicit, documented decision to run without one.
@@ -282,7 +283,8 @@ server/
   msgraph.js      Microsoft Graph client (OAuth client credentials)
   onedrive.js     OneDrive/SharePoint folder tree + background document sync
   ai-review.js    Claude document review pipeline (gated, queued, retryable)
-  storage.js      encrypted document storage
+  storage.js      encrypted document storage (local volume or object store)
+  objectstore.js  S3-compatible client (SigV4), for serverless deployments
   log.js          activity timeline + hash-chained audit log
   sentry.js       error reporting with PII scrubbing
   serialize.js    API shapes, strictly separate client and broker views
@@ -330,6 +332,9 @@ actually reaches.
   document store, restore, confirm documents still decrypt.
 - `integrations.test.js` — Microsoft Graph and the Anthropic API against local
   servers speaking the real protocols, plus the three AI consent gates.
+- `storage.test.js` — the object-store backend against a local server that
+  verifies AWS Signature V4 the way a real bucket does, including backup and
+  restore, and the refusal to run on an ephemeral filesystem.
 - `smtp.test.js` — a real STARTTLS + AUTH LOGIN + DATA conversation.
 
 ## Operational notes

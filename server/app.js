@@ -74,6 +74,7 @@ function ready() {
  */
 function assertProductionConfig() {
   require('./crypto-store').assertConfigured();
+  require('./storage').assertBackendUsable();
   require('./scan').assertConfiguredForProduction();
 
   if (process.env.NODE_ENV !== 'production') return;

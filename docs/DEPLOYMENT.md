@@ -95,13 +95,40 @@ Store these in your platform's secret manager. They must never enter git.
 
 ## 3. Document storage
 
-Uploaded documents live in `DATA_DIR` (default `./data`) as encrypted blobs, and
-are mirrored to OneDrive/SharePoint when Microsoft Graph is configured.
+Uploaded documents are stored as encrypted blobs, and mirrored to
+OneDrive/SharePoint when Microsoft Graph is configured. There are two backends.
 
-**Serverless platforms have an ephemeral filesystem.** On Vercel, `DATA_DIR`
-must point at a persistent volume, or OneDrive must be configured and treated
-as the system of record. Verify document retrieval after your first deploy —
-see the go-live checklist at the end.
+**Local (default)** — a directory under `DATA_DIR`. Correct for a long-running
+server with a persistent volume.
+
+**Object store** — any S3-compatible bucket. **Required on Vercel and any other
+serverless platform**, whose filesystem is empty again on the next request: a
+document written locally there is simply gone. The application refuses to start
+in that situation rather than losing a client's documents quietly.
+
+```
+STORAGE_BACKEND=s3
+S3_ENDPOINT=https://<project>.supabase.co/storage/v1/s3
+S3_REGION=<your project region, e.g. us-east-1>
+S3_BUCKET=mortgage-documents
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+S3_PREFIX=documents                 # optional
+```
+
+On Supabase: **Storage → New bucket**, keep it **private**, then **Project
+Settings → Storage → S3 access keys → New access key**. The same variables work
+unchanged against Cloudflare R2, MinIO or AWS S3 (set `S3_FORCE_PATH_STYLE=false`
+for AWS's virtual-hosted style).
+
+The bucket only ever holds ciphertext — documents are encrypted before they
+leave the application — so bucket compromise alone does not disclose a client's
+documents. Keep the bucket private regardless: public objects would still leak
+which clients exist and how many documents each has.
+
+If you genuinely have a persistent volume mounted at `DATA_DIR` on a platform
+the application detects as serverless, `ALLOW_EPHEMERAL_STORAGE=1` overrides the
+refusal. Do not set it to make an error go away.
 
 ---
 
@@ -279,8 +306,10 @@ Work through this against the real production URL, signed in as a real account:
 - [ ] `DOCUMENT_ENCRYPTION_KEYS` is set and backed up **outside** the hosting
       account.
 - [ ] Create a test client. Confirm the welcome email actually arrives.
-- [ ] Upload a document as that client. Confirm the file on disk is unreadable
+- [ ] Upload a document as that client. Confirm the stored blob is unreadable
       ciphertext and that the broker can still open it.
+- [ ] On a serverless deployment, confirm the document is still retrievable
+      after the function has gone cold (wait a few minutes, then open it).
 - [ ] Sign in as a role without `documents.download` and confirm both preview
       and download are refused.
 - [ ] Create a second test client and confirm neither can see the other's
@@ -307,7 +336,11 @@ Work through this against the real production URL, signed in as a real account:
 | `FORCE_SECURE_COOKIES` | yes (prod) | Must be `1` |
 | `TRUST_PROXY` | recommended | Number of trusted reverse proxies (default `0`) |
 | `PORT` | no | Default `3000` |
-| `DATA_DIR` | no | Where encrypted documents are written (default `./data`) |
+| `DATA_DIR` | no | Where encrypted documents are written with the local backend (default `./data`) |
+| `STORAGE_BACKEND` | yes (serverless) | `local` or `s3` |
+| `S3_ENDPOINT` / `S3_BUCKET` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | for s3 | Object storage for documents |
+| `S3_PREFIX` / `S3_FORCE_PATH_STYLE` | no | Key prefix (default `documents`); path-style addressing (default on) |
+| `ALLOW_EPHEMERAL_STORAGE` | no | Override the serverless storage refusal — only with a real volume |
 | `EMAIL_TRANSPORT` | yes (prod) | `graph`, `smtp`, `log`, `disabled` |
 | `MS_TENANT_ID` / `MS_CLIENT_ID` / `MS_CLIENT_SECRET` / `MS_MAILBOX` | for Graph | Microsoft 365 app registration |
 | `ONEDRIVE_TARGET` / `SHAREPOINT_SITE_ID` / `ONEDRIVE_ROOT` | for filing | Where documents are mirrored |

@@ -572,6 +572,36 @@ describe('cross-site request forgery', () => {
   });
 });
 
+describe('error reporting (Sentry)', () => {
+  test('nothing that reaches Sentry carries a secret or client PII', () => {
+    const sentry = require('../server/sentry');
+    const scrubbed = sentry.scrub({
+      env: 'DOCUMENT_ENCRYPTION_KEYS=v1:AAAABBBBCCCC failed to parse',
+      db: 'connect ECONNREFUSED for postgres://app:hunter2@db.example.com:5432/mortgage',
+      anthropic: 'Anthropic rejected sk-ant-api03-abcdefghijklmnop',
+      contact: 'call the client on 416-555-0101',
+      client: 'alice@test.local uploaded SIN 123456789',
+      graph: 'MS_CLIENT_SECRET: Abc~9defGHI',
+      nested: { password: 'hunter2' },
+      harmless: 'document 42 failed validation',
+    });
+    assert.ok(!JSON.stringify(scrubbed).includes('AAAABBBBCCCC'));
+    assert.ok(!JSON.stringify(scrubbed).includes('hunter2'));
+    assert.ok(!JSON.stringify(scrubbed).includes('sk-ant-'));
+    assert.ok(!JSON.stringify(scrubbed).includes('416-555-0101'));
+    assert.ok(!JSON.stringify(scrubbed).includes('alice@test.local'));
+    assert.ok(!JSON.stringify(scrubbed).includes('123456789'));
+    assert.ok(!JSON.stringify(scrubbed).includes('Abc~9defGHI'));
+    assert.equal(scrubbed.harmless, 'document 42 failed validation', 'useful detail survives');
+  });
+
+  test('reporting is off unless a DSN is configured, and never throws', () => {
+    const sentry = require('../server/sentry');
+    assert.equal(sentry.isEnabled(), false);
+    assert.doesNotThrow(() => sentry.captureException(new Error('boom'), { request: { path: '/x' } }));
+  });
+});
+
 describe('response hardening', () => {
   test('security headers are present on application responses', async () => {
     const res = await admin.get('/api/auth/me');

@@ -51,10 +51,25 @@ function isEnabled() {
 const SECRET_KEY_RE = /(password|secret|token|authorization|cookie|api[-_]?key|dsn|connection|dob|sin|account)/i;
 const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/g;
 const LONG_DIGITS_RE = /\b\d{7,}\b/g;
+// A phone number written the way a person writes one, which LONG_DIGITS_RE
+// misses because of the separators.
+const PHONE_RE = /(?:\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b/g;
+// NAME=value, where NAME names a secret. Error messages routinely quote the
+// environment variable that was wrong, along with its value.
+const ASSIGNED_SECRET_RE =
+  /\b([A-Za-z_][A-Za-z0-9_]*(?:PASSWORD|SECRET|TOKEN|KEY|KEYS|DSN|CREDENTIAL|AUTH)[A-Za-z0-9_]*)\s*[=:]\s*\S+/gi;
+// Provider key formats worth catching wherever they appear.
+const KNOWN_SECRET_RE = /\b(sk-ant-[\w-]{8,}|sk-[A-Za-z0-9]{16,}|xox[baprs]-[\w-]{8,}|AKIA[0-9A-Z]{12,})\b/g;
+// A connection string carrying inline credentials.
+const CONNECTION_RE = /\b([a-z][a-z0-9+.-]*):\/\/[^\s:@/]+:[^\s@/]+@/gi;
 
 function scrubString(value) {
   return String(value)
+    .replace(ASSIGNED_SECRET_RE, '$1=[redacted]')
+    .replace(KNOWN_SECRET_RE, '[redacted]')
+    .replace(CONNECTION_RE, '$1://[redacted]@')
     .replace(EMAIL_RE, '[email]')
+    .replace(PHONE_RE, '[phone]')
     .replace(LONG_DIGITS_RE, '[number]')
     .slice(0, 2000);
 }

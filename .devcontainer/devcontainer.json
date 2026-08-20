@@ -7,7 +7,14 @@
   "portsAttributes": {
     "3000": {
       "label": "Mortgage Client Platform",
-      "onAutoForward": "openPreview"
+      "onAutoForward": "openPreview",
+      // Demo environment only. A forwarded port defaults to Private, and
+      // GitHub's proxy then answers 401 for any browser that is not signed
+      // in to this codespace — which looks like the app is broken. Public
+      // means "anyone with this unguessable URL reaches the sign-in page";
+      // it does not expose data, because every endpoint is still behind
+      // authentication. Do not copy this into a real deployment.
+      "visibility": "public"
     }
   },
   "postCreateCommand": "bash .devcontainer/setup.sh",

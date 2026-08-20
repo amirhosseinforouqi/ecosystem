@@ -37,8 +37,18 @@ setup screen shows a key to type into any authenticator app (Microsoft
 Authenticator, Google Authenticator, 1Password…), and the seeder prints an
 `otpauth://` link you can open on your phone.
 
-If the preview doesn't open automatically, check the **Ports** tab for the
-forwarded `3000` URL, or run `bash .devcontainer/start.sh`.
+If the preview doesn't open automatically, check the **PORTS** tab at the
+bottom of the editor and click the globe icon next to port 3000.
+
+**Seeing `HTTP ERROR 401` on the `*.app.github.dev` URL?** That is GitHub's
+port-forwarding proxy, not this application — the forwarded port is Private and
+the browser is not signed in to that codespace. In the **PORTS** tab,
+right-click port 3000 → **Port Visibility** → **Public**. (New codespaces set
+this automatically; older ones need it once.)
+
+**Seeing `HTTP ERROR 502`?** Nothing is listening yet. Run
+`bash .devcontainer/start.sh` — it prints the server log if the port does not
+come up.
 
 **Want a blank slate** — to walk someone through the "create a client" flow from
 an empty dashboard?

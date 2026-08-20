@@ -328,6 +328,53 @@ describe('encryption at rest (audit finding C1)', () => {
     assert.deepEqual(res.bytes, helpers.PDF);
   });
 
+  test('a key rotation keeps old documents readable, and can re-wrap them', async () => {
+    const crypto = require('node:crypto');
+    const cryptoStore = require('../server/crypto-store');
+    const db = require('../server/db');
+    const { parseJsonSafe } = require('../server/util');
+
+    const before = parseJsonSafe(
+      (await db.get('SELECT enc_envelope FROM document_versions WHERE id = ?', aliceVersionId)).enc_envelope,
+      null
+    );
+    assert.equal(before.key_id, 'v1');
+
+    // Rotate: the new key becomes active, the old one is retained.
+    const original = process.env.DOCUMENT_ENCRYPTION_KEYS;
+    process.env.DOCUMENT_ENCRYPTION_KEYS = `${original},v2:${crypto.randomBytes(32).toString('base64')}`;
+    process.env.DOCUMENT_ENCRYPTION_ACTIVE_KEY = 'v2';
+    cryptoStore.resetKeyCache();
+
+    // Documents wrapped with v1 must keep working — dropping an old key is
+    // how a brokerage loses its own files permanently.
+    const stillReadable = await alice.get(`/api/client/versions/${aliceVersionId}/file`);
+    assert.equal(stillReadable.status, 200);
+    assert.deepEqual(stillReadable.bytes, helpers.PDF);
+
+    // A new upload uses the new key.
+    const docs = await alice.get(`/api/client/files/${fileA}/documents`);
+    const target = docs.data.requests.find((r) => r.id !== aliceRequestId && r.applicant_id === null);
+    const uploaded = await alice.upload(`/api/client/requests/${target.id}/upload`, helpers.PDF, 'new.pdf');
+    assert.equal(uploaded.status, 200);
+    const fresh = parseJsonSafe(
+      (await db.get('SELECT enc_envelope FROM document_versions WHERE id = ?', uploaded.data.request.current_version.id)).enc_envelope,
+      null
+    );
+    assert.equal(fresh.key_id, 'v2');
+
+    // Removing the old key makes v1 documents unreadable — refused, not served.
+    process.env.DOCUMENT_ENCRYPTION_KEYS = `v2:${process.env.DOCUMENT_ENCRYPTION_KEYS.split('v2:')[1]}`;
+    cryptoStore.resetKeyCache();
+    const lost = await alice.get(`/api/client/versions/${aliceVersionId}/file`);
+    assert.equal(lost.status, 500, 'a missing key must fail closed, never serve garbage');
+
+    process.env.DOCUMENT_ENCRYPTION_KEYS = original;
+    process.env.DOCUMENT_ENCRYPTION_ACTIVE_KEY = 'v1';
+    cryptoStore.resetKeyCache();
+    assert.equal((await alice.get(`/api/client/versions/${aliceVersionId}/file`)).status, 200);
+  });
+
   test('tampering with the ciphertext is detected rather than served', async () => {
     const db = require('../server/db');
     const version = await db.get('SELECT * FROM document_versions WHERE id = ?', aliceVersionId);

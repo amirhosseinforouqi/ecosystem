@@ -72,9 +72,22 @@ Set the two values it prints:
 - `DOCUMENT_ENCRYPTION_ACTIVE_KEY` — the key new documents are wrapped with
 
 **Never remove an old key.** Documents wrapped with it become permanently
-unreadable. To rotate, run `npm run keygen -- --rotate`, append the new key and
-point `DOCUMENT_ENCRYPTION_ACTIVE_KEY` at it; existing documents stay readable
-under their original key.
+unreadable. To rotate:
+
+```bash
+npm run keygen -- --rotate          # append the new key, point ACTIVE_KEY at it
+npm run encrypt:backfill -- --rewrap            # report what is still on the old key
+npm run encrypt:backfill -- --rewrap --apply    # re-wrap it
+```
+
+Existing documents stay readable under their original key throughout, so the
+re-wrap can run at any time. Only once it reports zero documents on the old key
+may that key be retired.
+
+The same command backfills anything that predates encryption
+(`npm run encrypt:backfill -- --apply`), and `--orphans` lists blobs on disk
+that no database row references. Orphans are only ever listed, never deleted —
+check them against your backups and remove them by hand.
 
 Store these in your platform's secret manager. They must never enter git.
 

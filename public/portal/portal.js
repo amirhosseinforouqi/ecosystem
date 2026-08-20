@@ -21,6 +21,10 @@ async function boot() {
     window.location.href = '/login';
     return;
   }
+  if (state.me.must_change_password) {
+    window.location.href = '/change-password';
+    return;
+  }
   if (state.me.is_staff) {
     window.location.href = '/broker';
     return;

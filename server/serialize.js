@@ -124,6 +124,9 @@ function requestFull(requestId, { includeInternal = false } = {}) {
   };
 
   if (includeInternal) {
+    // Brokerage-only fields. The client-facing branch above deliberately
+    // omits internal notes, AI review output and storage locations.
+    const { reviewForVersion } = require('./ai-review');
     base.internal_note = r.internal_note;
     base.source = r.source;
     base.reminders_enabled = r.reminders_enabled;
@@ -143,7 +146,13 @@ function requestFull(requestId, { includeInternal = false } = {}) {
       reviewed_at: v.reviewed_at,
       review_note_client: v.review_note_client,
       review_note_internal: v.review_note_internal,
+      onedrive_status: v.onedrive_status,
+      onedrive_path: v.onedrive_path,
+      onedrive_item_id: v.onedrive_item_id,
+      onedrive_error: v.onedrive_error,
+      ai_review: reviewForVersion(v.id),
     }));
+    base.ai_review = current ? reviewForVersion(current.id) : null;
   }
   return base;
 }

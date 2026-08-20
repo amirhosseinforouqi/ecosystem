@@ -117,6 +117,64 @@ SMTP client built on Node's own `net`/`tls` modules (`server/smtp.js`) — no
 external mail package, and it's covered by `npm test` against a real
 STARTTLS conversation, not a stub.
 
+## Connect Microsoft 365 (Outlook email + OneDrive storage)
+
+Both the client emails and the document storage run on **one** Microsoft Entra
+app registration using OAuth client credentials. Your mailbox password is
+never entered into or stored by this application.
+
+**One-time setup in the Azure portal** (portal.azure.com → Microsoft Entra ID):
+
+1. **App registrations → New registration.** Name it (e.g. "Mortgage
+   Platform"), single tenant, no redirect URI. Copy the
+   **Application (client) ID** and **Directory (tenant) ID**.
+2. **Certificates & secrets → New client secret.** Copy the secret *value*
+   immediately — it is shown only once.
+3. **API permissions → Add a permission → Microsoft Graph → Application
+   permissions**, add:
+   - `Mail.Send` — send client email from your mailbox
+   - `Files.ReadWrite.All` — write documents into your OneDrive
+   Then click **Grant admin consent**. (Application permissions require an
+   admin; without consent every call returns 403.)
+4. Note the mailbox/user principal name whose Outlook and OneDrive you want
+   used, e.g. `broker@yourbrokerage.com`.
+
+**Environment variables:**
+
+```bash
+EMAIL_TRANSPORT=graph                 # send through Microsoft 365
+MS_TENANT_ID=<Directory (tenant) ID>
+MS_CLIENT_ID=<Application (client) ID>
+MS_CLIENT_SECRET=<client secret value>
+MS_MAILBOX=broker@yourbrokerage.com   # mailbox + OneDrive used by the platform
+ONEDRIVE_ROOT="Mortgage Clients"      # optional; top-level folder name
+```
+
+Setting these turns on both integrations. Settings → Integrations in the
+broker portal shows live connection status for each.
+
+Optional narrowing: `Mail.Send` grants the app send rights for *every*
+mailbox in the tenant. To restrict it to the one mailbox, apply an
+[application access policy](https://learn.microsoft.com/graph/auth-limit-mailbox-access)
+in Exchange Online.
+
+## Connect Claude document review
+
+Uploaded documents are reviewed in the background by Claude using the
+reusable skill at `skills/document-review/SKILL.md` — that file *is* the
+system prompt, so you change review behavior by editing it, not the code.
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...      # from console.anthropic.com
+ANTHROPIC_MODEL=claude-opus-5     # optional; this is the default
+```
+
+Reviews never block an upload: the client's upload succeeds immediately, the
+review runs on a background pass, retries on failure, and results are stored
+in the `ai_reviews` table. The output is **internal to the brokerage** — it
+never reaches the client portal or any client email, and it never approves
+or rejects anything. The broker makes every decision.
+
 ## The two experiences
 
 **Broker portal** (`/broker`) — an *action dashboard*, not a client list:
@@ -138,12 +196,37 @@ auto-matched to checklist items and the broker can always reclassify.
 
 ## Key mechanics
 
+- **Guided client creation** — Add Client is a four-step wizard: pick the
+  service, pick the employment status, review the checklist the rules
+  generated (add/remove/edit any item for this client), then enter details.
+  Creating the client also creates the portal account, generates a secure
+  temporary password, creates the OneDrive folder tree, and sends the
+  welcome email — automatically.
+- **Temporary password flow** — the client signs in with the credentials
+  from their welcome email and *must* set their own password before any
+  portal data is reachable. Passwords are only ever stored as scrypt
+  hashes; changing the password replaces the hash, so the temporary one
+  stops working immediately. The stored copy of the welcome email has the
+  temporary password redacted.
+- **Three separate document layers** —
+  **catalog** (Settings → Document catalog: every document kind, its
+  category and its client-facing instructions) →
+  **rules** (Settings → Document rules: service + employment ⇒ defaults) →
+  **client checklist** (what one specific client actually owes).
+  Editing one client's checklist records a per-file exclusion, so re-running
+  the rules never re-adds it *and* every other client keeps the full
+  default. Removed items are restorable per client.
 - **Document requirement engine** — brokers configure combinable IF/THEN
   rules (Settings → Document rules), e.g. *IF application type is Purchase
   AND applicant is an employee THEN require T4, pay stub (valid 60 days),
   employment letter, NOA — per applicant*. Checklists are generated and
   re-synced automatically when application type, FTHB status, or applicants
   change. No manual checklist building, no coding.
+- **Upload pipeline** — validate → store → return success to the client →
+  (background) Claude review with the project skill → structured result in
+  the database → original copied to OneDrive under the client's file number
+  → broker notified. Every stage is retryable; a Claude or Microsoft outage
+  never loses a document.
 - **Multi-applicant files** — co-borrowers, spouses, guarantors; each with
   their own employment info, per-applicant documents, and optional portal
   access. Every document is labelled with the applicant it belongs to.
@@ -199,19 +282,25 @@ server/
   router.js       tiny method+pattern router
   db.js           SQLite (node:sqlite), schema, helpers
   seed.js         default stages/types/rules/templates/permissions
-  auth.js         passwords, sessions, lockout, RBAC, client isolation
-  checklist.js    document requirement engine
+  auth.js         passwords, temporary credentials, sessions, RBAC, isolation
+  checklist.js    document requirement engine + per-client customization
   nextstep.js     client "next step" + broker attention computation
-  reminders.js    background scheduler (reminders, expiry, overdue tasks)
+  reminders.js    background scheduler (reminders, expiry, AI review, OneDrive)
   emails.js       template rendering + pluggable outbox transport
+  smtp.js         zero-dependency SMTP client (app-password mailboxes)
+  msgraph.js      Microsoft Graph client (OAuth client credentials)
+  onedrive.js     OneDrive folder tree + background document sync
+  ai-review.js    Claude document review pipeline (queued, retryable)
   notify.js       in-portal notifications
-  storage.js      document storage abstraction (local driver)
+  storage.js      document storage abstraction (local working copy)
   log.js          activity timeline + append-only audit log
   serialize.js    API shapes incl. friendly client-facing statuses
   routes/         auth / broker / client / settings APIs
+skills/
+  document-review/SKILL.md   the reusable Claude review skill (= system prompt)
 public/           two vanilla-JS SPAs (broker/, portal/) + shared design system
-tests/            end-to-end tests for the 10 core UX scenarios
-scripts/          demo data seeder
+tests/            scenarios / integrations / checklist / smtp suites
+scripts/          demo seeder, broker-only reset, test email
 ```
 
 Deliberate choices, per the product's phased plan:

@@ -155,24 +155,54 @@ function overdueTaskPass() {
 }
 
 let timer = null;
+let jobTimer = null;
+let jobsRunning = false;
 
-function startScheduler(intervalMs = 5 * 60 * 1000) {
-  const tick = async () => {
+async function runPasses(passes) {
+  // Each pass is independent: one failing must not stop the others.
+  for (const [name, pass] of passes) {
     try {
-      await runReminderPass();
-      runExpiryPass();
-      overdueTaskPass();
+      await pass();
     } catch (err) {
-      console.error('[scheduler] pass failed:', err);
+      console.error(`[scheduler] ${name} pass failed:`, err.message);
     }
-  };
+  }
+}
+
+/** Document pipeline jobs — run frequently so uploads are processed promptly. */
+async function processBackgroundJobs() {
+  if (jobsRunning) return; // never overlap a slow Claude/Graph call with the next tick
+  jobsRunning = true;
+  try {
+    await runPasses([
+      ['ai-review', require('./ai-review').processAiReviews],
+      ['onedrive', require('./onedrive').processOneDriveSync],
+    ]);
+  } finally {
+    jobsRunning = false;
+  }
+}
+
+function startScheduler(intervalMs = 5 * 60 * 1000, jobIntervalMs = 15 * 1000) {
+  const tick = () => runPasses([
+    ['reminders', runReminderPass],
+    ['expiry', runExpiryPass],
+    ['overdue-tasks', overdueTaskPass],
+  ]);
   timer = setInterval(tick, intervalMs);
   if (timer.unref) timer.unref();
   setTimeout(tick, 5000).unref?.();
+
+  jobTimer = setInterval(processBackgroundJobs, jobIntervalMs);
+  if (jobTimer.unref) jobTimer.unref();
 }
 
 function stopScheduler() {
   if (timer) clearInterval(timer);
+  if (jobTimer) clearInterval(jobTimer);
 }
 
-module.exports = { startScheduler, stopScheduler, sendDocumentReminder, runReminderPass, runExpiryPass };
+module.exports = {
+  startScheduler, stopScheduler, sendDocumentReminder,
+  runReminderPass, runExpiryPass, processBackgroundJobs,
+};

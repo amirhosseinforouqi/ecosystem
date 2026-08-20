@@ -11,12 +11,16 @@ const {
 const { audit, activity } = require('../log');
 const { sendTemplate, portalBaseUrl } = require('../emails');
 const { notifyUser, notifyClientsForFile } = require('../notify');
-const { syncChecklist, checklistProgress } = require('../checklist');
+const {
+  syncChecklist, checklistProgress, previewChecklist,
+  excludeFromChecklist, unexcludeFromChecklist,
+} = require('../checklist');
 const { clientNextStep, fileAttention, OUTSTANDING_STATUSES } = require('../nextstep');
 const { requestFull, fileRequests, applicantSummary, publicUser, messageRow } = require('../serialize');
 const { sendDocumentReminder } = require('../reminders');
 const { saveRequestBody, openStored } = require('../storage');
 const { HANDLED } = require('../router');
+const aiReview = require('../ai-review');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -137,7 +141,16 @@ function insertApplicant(fileId, fields) {
   return Number(res.lastInsertRowid);
 }
 
-/** Create (or link) a portal account for an applicant and send the welcome email. */
+/**
+ * Create (or re-issue) a portal account for an applicant and send the
+ * welcome email carrying the temporary credentials.
+ *
+ * The username is the applicant's email address. A fresh temporary password
+ * is generated, hashed with scrypt, and stored only as that hash — the
+ * plaintext exists in memory long enough to render the email and is returned
+ * to the caller solely so the broker can read it back to a client who never
+ * received the email. It is redacted from the stored email_log copy.
+ */
 async function inviteApplicant(applicantId, actor, ctx, { sendEmail = true } = {}) {
   const applicant = get('SELECT * FROM applicants WHERE id = ?', applicantId);
   if (!applicant) throw new ApiError(404, 'Applicant not found.', 'not_found');
@@ -148,30 +161,60 @@ async function inviteApplicant(applicantId, actor, ctx, { sendEmail = true } = {
   if (user && user.role !== 'client') {
     throw new ApiError(400, 'That email belongs to a brokerage staff account and cannot be used for a client portal login.', 'email_conflict');
   }
+
+  const { generateTemporaryPassword, hashPassword } = require('../auth');
+  const temporaryPassword = generateTemporaryPassword();
+  const passwordHash = hashPassword(temporaryPassword);
+
   if (!user) {
     const res = run(
-      `INSERT INTO users (role, email, first_name, last_name, phone, status, created_at, updated_at)
-       VALUES ('client', ?, ?, ?, ?, 'invited', ?, ?)`,
-      applicant.email, applicant.first_name, applicant.last_name, applicant.phone, now(), now()
+      `INSERT INTO users (role, email, first_name, last_name, phone, password_hash, status, must_change_password, created_at, updated_at)
+       VALUES ('client', ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
+      applicant.email, applicant.first_name, applicant.last_name, applicant.phone, passwordHash, now(), now()
     );
     user = get('SELECT * FROM users WHERE id = ?', Number(res.lastInsertRowid));
+  } else {
+    // Re-issuing credentials for an existing portal account: new temporary
+    // password, forced change again, and every existing session dropped.
+    const { destroyAllSessions } = require('../auth');
+    run(
+      `UPDATE users SET password_hash = ?, status = 'active', must_change_password = 1,
+         failed_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?`,
+      passwordHash, now(), user.id
+    );
+    destroyAllSessions(user.id);
+    user = get('SELECT * FROM users WHERE id = ?', user.id);
   }
   run('UPDATE applicants SET portal_user_id = ?, updated_at = ? WHERE id = ?', user.id, now(), applicant.id);
 
-  const token = createAuthToken(user.id, 'activate', 24 * 7);
-  const link = `${portalBaseUrl()}/activate?token=${token}`;
+  const file = get('SELECT * FROM client_files WHERE id = ?', applicant.file_id);
+  const appType = file && file.application_type_id
+    ? get('SELECT * FROM application_types WHERE id = ?', file.application_type_id)
+    : null;
+  const link = `${portalBaseUrl()}/login`;
+
   if (sendEmail) {
     await sendTemplate('welcome', {
       toEmail: user.email,
       toName: fullName(applicant),
       userId: user.id,
       fileId: applicant.file_id,
-      vars: { client_first_name: applicant.first_name, client_last_name: applicant.last_name, portal_link: link },
+      vars: {
+        client_first_name: applicant.first_name,
+        client_last_name: applicant.last_name,
+        portal_link: link,
+        username: user.email,
+        temporary_password: temporaryPassword,
+        application_number: file ? file.file_number : '',
+        service_type: appType ? appType.name : '',
+        closing_date: file && file.closing_date ? file.closing_date : '',
+      },
+      redact: [temporaryPassword],
     });
-    activity(applicant.file_id, actor, 'email_sent', `Welcome email sent to ${fullName(applicant)}`);
+    activity(applicant.file_id, actor, 'email_sent', `Welcome email with portal credentials sent to ${fullName(applicant)}`);
   }
-  audit(actor ? actor.id : null, 'portal_invite', 'applicant', applicant.id, ctx ? ctx.ip : null, { user_id: user.id });
-  return { user, activation_link: link };
+  audit(actor ? actor.id : null, 'portal_account_created', 'applicant', applicant.id, ctx ? ctx.ip : null, { user_id: user.id });
+  return { user, username: user.email, temporary_password: temporaryPassword, portal_link: link };
 }
 
 function staffList() {
@@ -420,16 +463,84 @@ function register(router) {
       return { fileId, primaryId, coIds, fileNumber };
     });
 
+    // The wizard sends the checklist the broker actually approved. Anything
+    // the rules would have added but the broker removed is excluded for THIS
+    // file only; anything they added beyond the rules is created as a manual
+    // item. Global rules are never touched.
+    const customChecklist = Array.isArray(body.checklist) ? body.checklist : null;
+    if (customChecklist) {
+      const keptTypeIds = new Set(
+        customChecklist.map((c) => intOrNull(c.document_type_id)).filter(Boolean)
+      );
+      for (const want of previewChecklist(typeId, client.employment_type, { fthb: bool(app.fthb) })) {
+        if (!keptTypeIds.has(want.document_type_id)) {
+          excludeFromChecklist(created.fileId, want.document_type_id, null, ctx.user.id);
+          excludeFromChecklist(created.fileId, want.document_type_id, created.primaryId, ctx.user.id);
+        }
+      }
+    }
+
     const { added } = syncChecklist(created.fileId, ctx.user.id);
+
+    // Apply per-item customizations and add anything the rules did not cover.
+    if (customChecklist) {
+      for (const item of customChecklist.slice(0, 100)) {
+        const docTypeId = intOrNull(item.document_type_id);
+        if (!docTypeId) continue;
+        const docType = get('SELECT * FROM document_types WHERE id = ?', docTypeId);
+        if (!docType) continue;
+        const requirement = item.requirement === 'optional' ? 'optional' : 'required';
+        const message = item.instructions !== undefined ? str(item.instructions, 1000) : docType.description;
+        const existing = get(
+          'SELECT * FROM document_requests WHERE file_id = ? AND document_type_id = ? ORDER BY id LIMIT 1',
+          created.fileId, docTypeId
+        );
+        if (existing) {
+          run(
+            'UPDATE document_requests SET requirement = ?, client_message = ?, due_date = ?, updated_at = ? WHERE id = ?',
+            requirement, message, dateStr(item.due_date), now(), existing.id
+          );
+        } else {
+          run(
+            `INSERT INTO document_requests
+               (file_id, applicant_id, document_type_id, status, requirement, source, due_date, client_message, expires_days, created_by, created_at, updated_at)
+             VALUES (?, NULL, ?, 'required', ?, 'manual', ?, ?, ?, ?, ?, ?)`,
+            created.fileId, docTypeId, requirement, dateStr(item.due_date), message,
+            docType.default_expires_days ?? null, ctx.user.id, now(), now()
+          );
+        }
+      }
+    }
+
     activity(created.fileId, ctx.user, 'client_created', `Client file created (${created.fileNumber})`);
-    if (added) activity(created.fileId, ctx.user, 'checklist_created', `Document checklist created (${added} item${added > 1 ? 's' : ''})`);
+    const finalCount = get(
+      'SELECT COUNT(*) AS n FROM document_requests WHERE file_id = ?', created.fileId
+    ).n;
+    if (finalCount) {
+      activity(created.fileId, ctx.user, 'checklist_created', `Document checklist created (${finalCount} item${finalCount > 1 ? 's' : ''})`);
+    }
     audit(ctx.user.id, 'client_created', 'client_file', created.fileId, ctx.ip);
 
+    // Create the client's OneDrive folder tree in the background.
+    require('../onedrive').queueFolderCreation(created.fileId);
+
+    // Portal account + welcome email with temporary credentials. Automatic —
+    // the broker never has to send this by hand — but the brokerage can turn
+    // auto-send off in Settings → Notifications.
+    const autoSend = getSetting('notifications', {}).auto_send_welcome !== false;
+    const wantWelcome = body.send_welcome !== false && autoSend;
     const invites = [];
-    if (body.send_welcome !== false && client.email) {
+    if (client.email) {
       try {
-        const inv = await inviteApplicant(created.primaryId, ctx.user, ctx);
-        invites.push({ applicant_id: created.primaryId, email: client.email, activation_link: inv.activation_link });
+        const inv = await inviteApplicant(created.primaryId, ctx.user, ctx, { sendEmail: wantWelcome });
+        invites.push({
+          applicant_id: created.primaryId,
+          email: client.email,
+          username: inv.username,
+          temporary_password: inv.temporary_password,
+          portal_link: inv.portal_link,
+          emailed: wantWelcome,
+        });
       } catch (err) {
         invites.push({ applicant_id: created.primaryId, error: err.message });
       }
@@ -437,8 +548,14 @@ function register(router) {
     for (const co of created.coIds) {
       if (!co.invite) continue;
       try {
-        const inv = await inviteApplicant(co.id, ctx.user, ctx);
-        invites.push({ applicant_id: co.id, activation_link: inv.activation_link });
+        const inv = await inviteApplicant(co.id, ctx.user, ctx, { sendEmail: wantWelcome });
+        invites.push({
+          applicant_id: co.id,
+          username: inv.username,
+          temporary_password: inv.temporary_password,
+          portal_link: inv.portal_link,
+          emailed: wantWelcome,
+        });
       } catch (err) {
         invites.push({ applicant_id: co.id, error: err.message });
       }
@@ -556,9 +673,12 @@ function register(router) {
     activity(file.id, ctx.user, 'applicant_added', `${fields.first_name} ${fields.last_name} added to the file (${fields.role.replace('_', '-')})`);
     let invite = null;
     if (ctx.body && ctx.body.invite) {
-      try { invite = await inviteApplicant(id, ctx.user, ctx); } catch (err) { invite = { error: err.message }; }
+      try {
+        const inv = await inviteApplicant(id, ctx.user, ctx);
+        invite = { username: inv.username, temporary_password: inv.temporary_password, portal_link: inv.portal_link };
+      } catch (err) { invite = { error: err.message }; }
     }
-    return { ok: true, applicant_id: id, checklist_sync: sync, invite: invite && invite.activation_link ? { activation_link: invite.activation_link } : invite };
+    return { ok: true, applicant_id: id, checklist_sync: sync, invite };
   });
 
   router.patch('/api/broker/applicants/:id', requirePermission('clients.edit'), (ctx) => {
@@ -608,7 +728,12 @@ function register(router) {
     const applicant = get('SELECT * FROM applicants WHERE id = ?', Number(ctx.params.id));
     if (!applicant) throw new ApiError(404, 'Applicant not found.', 'not_found');
     const result = await inviteApplicant(applicant.id, ctx.user, ctx);
-    return { ok: true, activation_link: result.activation_link };
+    return {
+      ok: true,
+      username: result.username,
+      temporary_password: result.temporary_password,
+      portal_link: result.portal_link,
+    };
   });
 
   // ------------------------------ Documents ------------------------------
@@ -699,6 +824,12 @@ function register(router) {
   router.delete('/api/broker/requests/:id', requirePermission('documents.request'), (ctx) => {
     const request = get('SELECT * FROM document_requests WHERE id = ?', Number(ctx.params.id));
     if (!request) throw new ApiError(404, 'Document request not found.', 'not_found');
+    // Removing a rule-generated item is a decision about THIS client only:
+    // record an exclusion so re-syncing the global rules never re-adds it,
+    // while every other client keeps the same default.
+    if (request.source === 'rule') {
+      excludeFromChecklist(request.file_id, request.document_type_id, request.applicant_id ?? null, ctx.user.id);
+    }
     const hasUploads = get('SELECT id FROM document_versions WHERE request_id = ? LIMIT 1', request.id);
     if (hasUploads) {
       // History is never silently destroyed — waive instead of delete.
@@ -707,8 +838,49 @@ function register(router) {
       return { ok: true, waived: true };
     }
     run('DELETE FROM document_requests WHERE id = ?', request.id);
-    activity(request.file_id, ctx.user, 'document_request_removed', 'A document request was removed');
+    activity(request.file_id, ctx.user, 'document_request_removed', 'A document request was removed for this client');
     return { ok: true };
+  });
+
+  /**
+   * Wizard step 3: default checklist for a service + employment status,
+   * computed from the global rules. Read-only — nothing is written, and no
+   * client record needs to exist yet.
+   */
+  router.get('/api/broker/checklist-preview', requirePermission('clients.create'), (ctx) => {
+    const documents = previewChecklist(
+      intOrNull(ctx.query.application_type_id),
+      str(ctx.query.employment_type, 50),
+      { fthb: ctx.query.fthb === '1' || ctx.query.fthb === 'true' }
+    );
+    return { documents };
+  });
+
+  /** Restore a previously removed rule item for this client. */
+  router.post('/api/broker/files/:id/checklist/restore', requirePermission('documents.request'), (ctx) => {
+    const file = fileOrThrow(ctx.params.id);
+    const docTypeId = intOrNull(ctx.body && ctx.body.document_type_id);
+    if (!docTypeId) throw new ApiError(400, 'Choose a document to restore.', 'missing_field');
+    const scopedApplicant = ctx.body && ctx.body.applicant_id !== undefined
+      ? intOrNull(ctx.body.applicant_id)
+      : undefined; // undefined = restore for the whole file
+    unexcludeFromChecklist(file.id, docTypeId, scopedApplicant);
+    const sync = syncChecklist(file.id, ctx.user.id);
+    activity(file.id, ctx.user, 'checklist_updated', 'A removed document was restored to this checklist');
+    return { ok: true, checklist_sync: sync };
+  });
+
+  /** Documents the broker removed for this client (so the UI can offer restore). */
+  router.get('/api/broker/files/:id/checklist/exclusions', requirePermission('documents.view'), (ctx) => {
+    const file = fileOrThrow(ctx.params.id);
+    return {
+      exclusions: all(
+        `SELECT e.*, dt.name AS document_name, dt.category
+           FROM checklist_exclusions e JOIN document_types dt ON dt.id = e.document_type_id
+          WHERE e.file_id = ? ORDER BY dt.name`,
+        file.id
+      ),
+    };
   });
 
   router.post('/api/broker/requests/:id/review', requirePermission('documents.review'), async (ctx) => {
@@ -775,6 +947,62 @@ function register(router) {
       activity(file.id, null, 'checklist_complete', 'Every required document has been approved', {}, true);
     }
     return { ok: true, request: requestFull(request.id, { includeInternal: true }), progress };
+  });
+
+  /** Retry a failed AI review (internal-only result). */
+  router.post('/api/broker/ai-reviews/:id/retry', requirePermission('documents.review'), (ctx) => {
+    const { get: dbGet } = require('../db');
+    const review = dbGet('SELECT * FROM ai_reviews WHERE id = ?', Number(ctx.params.id));
+    if (!review) throw new ApiError(404, 'That AI review was not found.', 'not_found');
+    if (!aiReview.isEnabled()) {
+      throw new ApiError(400, 'AI document review is not configured on this server.', 'ai_disabled');
+    }
+    aiReview.retryReview(review.id);
+    return { ok: true };
+  });
+
+  /**
+   * Email the client a single summary of everything still outstanding.
+   * The same items are already visible in their portal — this is the
+   * notification layer, not the source of truth.
+   */
+  router.post('/api/broker/files/:id/request-outstanding', requirePermission('documents.request'), async (ctx) => {
+    const file = fileOrThrow(ctx.params.id);
+    const outstanding = all(
+      `SELECT r.*, dt.name AS document_name FROM document_requests r
+         JOIN document_types dt ON dt.id = r.document_type_id
+        WHERE r.file_id = ? AND r.requirement = 'required'
+          AND r.status IN (${OUTSTANDING_STATUSES.map(() => '?').join(',')})
+        ORDER BY dt.sort`,
+      file.id, ...OUTSTANDING_STATUSES
+    );
+    if (outstanding.length === 0) {
+      throw new ApiError(400, 'Nothing is outstanding for this client right now.', 'nothing_outstanding');
+    }
+    const users = all(
+      `SELECT u.* FROM users u JOIN applicants a ON a.portal_user_id = u.id WHERE a.file_id = ? GROUP BY u.id`,
+      file.id
+    );
+    if (users.length === 0) {
+      throw new ApiError(400, 'This client does not have portal access yet — create their account first.', 'no_recipient');
+    }
+    const list = outstanding
+      .map((r) => `- ${r.document_name}${r.client_message ? ` (${r.client_message})` : ''}`)
+      .join('\n');
+    for (const u of users) {
+      notifyUser(u.id, 'documents_outstanding', 'Documents still needed', `${outstanding.length} item${outstanding.length > 1 ? 's' : ''} outstanding`, file.id, '#/documents');
+      await sendTemplate('documents_outstanding', {
+        toEmail: u.email, toName: `${u.first_name} ${u.last_name}`.trim(), userId: u.id, fileId: file.id,
+        vars: {
+          client_first_name: u.first_name,
+          client_last_name: u.last_name,
+          document_list: list,
+          application_number: file.file_number,
+        },
+      });
+    }
+    activity(file.id, ctx.user, 'email_sent', `Outstanding documents email sent (${outstanding.length} item${outstanding.length > 1 ? 's' : ''})`);
+    return { ok: true, sent: users.length, documents: outstanding.length };
   });
 
   router.post('/api/broker/requests/:id/remind', requirePermission('documents.request'), async (ctx) => {
@@ -1236,6 +1464,12 @@ function recordVersion(request, saved, filename, uploader) {
     "UPDATE document_requests SET status = 'uploaded', current_version_id = ?, expires_at = NULL, updated_at = ? WHERE id = ?",
     versionId, now(), request.id
   );
+  // Both of these are queued, never awaited: the upload is already durable on
+  // disk and the client's request returns immediately. The scheduler picks
+  // them up and retries on failure, so a Claude or Graph outage can never
+  // lose a document.
+  aiReview.queueReview(versionId);
+  require('../onedrive').queueVersionSync(versionId);
   return versionId;
 }
 

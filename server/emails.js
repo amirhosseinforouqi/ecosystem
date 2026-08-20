@@ -48,6 +48,25 @@ const transports = {
     });
     return { ok: true };
   },
+  /**
+   * Sends through a connected Microsoft 365 / Outlook mailbox via the
+   * Microsoft Graph API (OAuth client credentials — the mailbox password is
+   * never entered into or stored by this application). Configured via
+   * MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAILBOX.
+   */
+  graph: async (email) => {
+    const msgraph = require('./msgraph');
+    if (!msgraph.isConfigured()) {
+      throw new Error('Microsoft 365 is not configured — set MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET and MS_MAILBOX.');
+    }
+    await msgraph.sendMailViaGraph({
+      toEmail: email.to_email,
+      toName: email.to_name,
+      subject: email.subject,
+      text: email.body,
+    });
+    return { ok: true };
+  },
 };
 
 function activeTransport() {
@@ -79,18 +98,29 @@ function portalBaseUrl() {
 /**
  * Render a template and queue+send it. Returns the email_log row id.
  * vars can include: client_first_name, client_last_name, application_stage,
- * document_name, closing_date, portal_link, ...
+ * document_name, closing_date, portal_link, username, application_number...
+ *
+ * `redact` lists secret values (e.g. a temporary password): they are sent in
+ * the real email but replaced with a mask in the stored email_log copy, so
+ * secrets are never persisted in plaintext.
  */
-async function sendTemplate(templateKey, { toEmail, toName, userId, fileId, vars = {} }) {
+async function sendTemplate(templateKey, { toEmail, toName, userId, fileId, vars = {}, redact = [] }) {
   const template = get('SELECT * FROM email_templates WHERE key = ?', templateKey);
   if (!template) return null;
   const merged = baseVars(vars);
   const subject = renderTemplate(template.subject, merged);
   const body = renderTemplate(template.body, merged);
+  let storedSubject = subject;
+  let storedBody = body;
+  for (const secret of redact) {
+    if (!secret) continue;
+    storedSubject = storedSubject.split(secret).join('••••••••');
+    storedBody = storedBody.split(secret).join('••••••••');
+  }
   const res = run(
     `INSERT INTO email_log (to_email, to_name, user_id, file_id, template_key, subject, body, status, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
-    toEmail, toName || '', userId ?? null, fileId ?? null, templateKey, subject, body, now()
+    toEmail, toName || '', userId ?? null, fileId ?? null, templateKey, storedSubject, storedBody, now()
   );
   const id = Number(res.lastInsertRowid);
 
@@ -115,6 +145,13 @@ function previewTemplate(subject, body) {
     application_stage: 'Documents Requested',
     document_name: 'Recent Pay Stub',
     closing_date: '2026-10-15',
+    username: 'john.smith@example.com',
+    temporary_password: 'Xk4-mQ9t-Bw2p',
+    application_number: 'MTG-2026-00128',
+    service_type: 'Purchase',
+    document_list: '- Most recent pay stub\n- Employment letter\n- 2025 Notice of Assessment',
+    notification_title: 'John Smith uploaded a new T4',
+    notification_body: 'File MTG-2026-00128',
   });
   return {
     subject: renderTemplate(subject, sample),

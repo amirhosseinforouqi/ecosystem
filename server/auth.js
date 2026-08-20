@@ -23,6 +23,26 @@ function verifyPassword(password, stored) {
   return crypto.timingSafeEqual(actual, expected);
 }
 
+/**
+ * Generate a readable but high-entropy temporary password (~62 bits).
+ * Grouped into blocks so a client can retype it from an email without
+ * confusion; excludes visually ambiguous characters (0/O, 1/l/I).
+ */
+function generateTemporaryPassword() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const bytes = crypto.randomBytes(12);
+  let out = '';
+  for (let i = 0; i < 12; i++) {
+    if (i > 0 && i % 4 === 0) out += '-';
+    out += alphabet[bytes[i] % alphabet.length];
+  }
+  // Guarantee the generated value satisfies validatePasswordStrength
+  // (letter + digit) regardless of how the random bytes landed.
+  if (!/[0-9]/.test(out)) out += '7';
+  if (!/[a-zA-Z]/.test(out)) out += 'k';
+  return out;
+}
+
 function validatePasswordStrength(password) {
   const p = String(password || '');
   if (p.length < 8) throw new ApiError(400, 'Password must be at least 8 characters long.', 'weak_password');
@@ -178,12 +198,29 @@ function requireAuth(ctx) {
   if (!ctx.user) throw new ApiError(401, 'Please sign in to continue.', 'unauthenticated');
 }
 
+/**
+ * Middleware: the account has finished the forced temporary-password change.
+ * A session created with a temporary password can do exactly two things —
+ * read /api/auth/me and set a new password — so a temporary credential can
+ * never be used to browse the portal or reach any data endpoint.
+ */
+function requirePasswordChanged(ctx) {
+  if (ctx.user && ctx.user.must_change_password) {
+    throw new ApiError(
+      403,
+      'Please choose a new password before continuing.',
+      'password_change_required'
+    );
+  }
+}
+
 /** Middleware: any brokerage staff member. */
 function requireStaff(ctx) {
   requireAuth(ctx);
   if (!STAFF_ROLES.includes(ctx.user.role)) {
     throw new ApiError(403, 'This area is only available to brokerage staff.', 'forbidden');
   }
+  requirePasswordChanged(ctx);
 }
 
 /** Middleware: client portal users only. */
@@ -192,6 +229,7 @@ function requireClient(ctx) {
   if (ctx.user.role !== 'client') {
     throw new ApiError(403, 'This area is only available to clients.', 'forbidden');
   }
+  requirePasswordChanged(ctx);
 }
 
 function requirePermission(permission) {
@@ -221,6 +259,8 @@ module.exports = {
   hashPassword,
   verifyPassword,
   validatePasswordStrength,
+  generateTemporaryPassword,
+  requirePasswordChanged,
   createSession,
   getSessionUser,
   destroySession,

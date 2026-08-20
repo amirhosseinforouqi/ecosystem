@@ -67,7 +67,10 @@ function serveFile(res, filePath) {
 
 /** SPA page routing: pretty URLs → the right portal's index.html. */
 function resolvePage(pathname) {
-  if (pathname === '/' || pathname === '/login' || pathname === '/activate' || pathname === '/reset') {
+  if (
+    pathname === '/' || pathname === '/login' || pathname === '/activate' ||
+    pathname === '/reset' || pathname === '/change-password'
+  ) {
     return path.join(PUBLIC_DIR, 'login.html');
   }
   if (pathname === '/broker' || pathname.startsWith('/broker/')) {

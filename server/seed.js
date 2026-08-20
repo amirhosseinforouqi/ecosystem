@@ -98,8 +98,24 @@ const DEFAULT_SETTINGS = {
     archive_completed_after_days: null,
     archive_inactive_after_days: null,
   },
+  notifications: {
+    auto_send_welcome: true,
+    email_broker_on_client_upload: false,
+    email_broker_on_client_message: false,
+  },
   role_permissions: DEFAULT_ROLE_PERMISSIONS,
 };
+
+const EMPLOYMENT_STATUSES = [
+  ['employee', 'Employee'],
+  ['self_employed', 'Self-Employed'],
+  ['corporation_owner', 'Corporation Owner'],
+  ['commissioned', 'Commissioned'],
+  ['contract_worker', 'Contract Worker'],
+  ['retired', 'Retired'],
+  ['unemployed', 'Not Employed'],
+  ['other', 'Other'],
+];
 
 const STAGES = [
   ['new_inquiry',        'New Inquiry',              'Getting started',                'We have received your information and will be in touch shortly.', 1, '#8b5cf6', 0, 0],
@@ -220,19 +236,28 @@ const DOCUMENT_RULES = [
 const EMAIL_TEMPLATES = [
   {
     key: 'welcome',
-    name: 'Welcome / account activation',
-    subject: 'Welcome to your {{brokerage_name}} client portal',
+    name: 'Welcome / account credentials',
+    subject: 'Welcome to {{brokerage_name}}',
     body: `Hi {{client_first_name}},
 
-Welcome! {{broker_name}} at {{brokerage_name}} has set up your secure client portal.
+Welcome to {{brokerage_name}}.
 
-Use it to see exactly where your mortgage application stands, upload documents, and message your broker.
+We have created your secure mortgage client portal. Use it to see exactly where your application stands, upload documents, and message {{broker_name}}.
 
-Activate your account and choose a password here:
+You can access your account here:
 {{portal_link}}
 
-If you have any questions, just reply through the portal — we're happy to help.
+Username:
+{{username}}
 
+Temporary Password:
+{{temporary_password}}
+
+Please log in and change your temporary password after your first login.
+
+If you have any questions, please contact {{broker_name}}.
+
+Best,
 {{broker_name}}
 {{brokerage_name}}`,
   },
@@ -355,6 +380,37 @@ There's an update on your mortgage application. Please log in to your portal for
 {{broker_name}}
 {{brokerage_name}}`,
   },
+  {
+    key: 'documents_outstanding',
+    name: 'Outstanding documents summary',
+    subject: 'Documents Required for Your Mortgage Application',
+    body: `Hi {{client_first_name}},
+
+We still need the following documents:
+
+{{document_list}}
+
+Please log in to your client portal to upload them:
+
+{{portal_link}}
+
+Thank you!
+{{broker_name}}
+{{brokerage_name}}`,
+  },
+  {
+    key: 'staff_notification',
+    name: 'Staff notification (internal)',
+    subject: '{{notification_title}}',
+    body: `{{notification_title}}
+
+{{notification_body}}
+
+Open the broker portal for details:
+{{portal_link}}
+
+— {{brokerage_name}} platform`,
+  },
 ];
 
 function seedIfNeeded() {
@@ -374,10 +430,17 @@ function seedIfNeeded() {
     });
   }
 
-  // Application types
+  // Application types (services)
   if (!get('SELECT id FROM application_types LIMIT 1')) {
     APPLICATION_TYPES.forEach(([key, name], i) => {
       run('INSERT INTO application_types (key, name, sort) VALUES (?, ?, ?)', key, name, (i + 1) * 10);
+    });
+  }
+
+  // Employment statuses (configurable; seeded once, then admin-managed)
+  if (!get('SELECT id FROM employment_statuses LIMIT 1')) {
+    EMPLOYMENT_STATUSES.forEach(([key, name], i) => {
+      run('INSERT INTO employment_statuses (key, name, sort) VALUES (?, ?, ?)', key, name, (i + 1) * 10);
     });
   }
 
@@ -442,4 +505,4 @@ function seedIfNeeded() {
   }
 }
 
-module.exports = { seedIfNeeded, ALL_PERMISSIONS, DEFAULT_ROLE_PERMISSIONS };
+module.exports = { seedIfNeeded, ALL_PERMISSIONS, DEFAULT_ROLE_PERMISSIONS, DEFAULT_EMAIL_TEMPLATES: EMAIL_TEMPLATES };

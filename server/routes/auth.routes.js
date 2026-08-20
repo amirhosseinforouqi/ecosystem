@@ -28,16 +28,19 @@ function clearSessionCookie(ctx) {
 }
 
 function homeFor(user) {
+  if (user.must_change_password) return '/change-password';
   return user.role === 'client' ? '/portal' : '/broker';
 }
 
 function meProfile(ctx) {
   const brokerage = getSetting('brokerage', {});
+  const mustChange = !!ctx.user.must_change_password;
   return {
     user: publicUser(ctx.user),
     is_staff: STAFF_ROLES.includes(ctx.user.role),
-    permissions: permissionsForRole(ctx.user.role),
-    unread_notifications: unreadCount(ctx.user.id),
+    must_change_password: mustChange,
+    permissions: mustChange ? [] : permissionsForRole(ctx.user.role),
+    unread_notifications: mustChange ? 0 : unreadCount(ctx.user.id),
     brokerage: {
       name: brokerage.name,
       broker_name: brokerage.broker_name,
@@ -155,13 +158,29 @@ function register(router) {
       throw new ApiError(400, 'Your current password was incorrect.', 'bad_credentials');
     }
     validatePasswordStrength(new_password);
-    run('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', hashPassword(new_password), now(), ctx.user.id);
+    if (String(new_password) === String(current_password)) {
+      throw new ApiError(400, 'Please choose a password different from your current one.', 'same_password');
+    }
+    // Replacing the hash is what invalidates the temporary password: it is
+    // never stored in plaintext and cannot be verified against the new hash.
+    run(
+      "UPDATE users SET password_hash = ?, must_change_password = 0, status = 'active', updated_at = ? WHERE id = ?",
+      hashPassword(new_password), now(), ctx.user.id
+    );
+    const wasForced = !!ctx.user.must_change_password;
     // Keep this session, drop all others.
     destroyAllSessions(ctx.user.id);
     const token = createSession(ctx.user.id, ctx.ip, ctx.req.headers['user-agent']);
     setSessionCookie(ctx, token);
-    audit(ctx.user.id, 'password_changed', 'user', ctx.user.id, ctx.ip);
-    return { ok: true };
+    audit(ctx.user.id, 'password_changed', 'user', ctx.user.id, ctx.ip, { forced: wasForced });
+    if (wasForced) {
+      const { all } = require('../db');
+      for (const a of all('SELECT DISTINCT file_id FROM applicants WHERE portal_user_id = ?', ctx.user.id)) {
+        activity(a.file_id, ctx.user, 'account_activated', `${ctx.user.first_name} ${ctx.user.last_name} set their permanent password`);
+      }
+    }
+    ctx.user = get('SELECT * FROM users WHERE id = ?', ctx.user.id);
+    return { ok: true, redirect: homeFor(ctx.user) };
   });
 
   router.post('/api/auth/welcome-seen', (ctx) => {

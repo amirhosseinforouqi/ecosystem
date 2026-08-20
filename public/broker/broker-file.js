@@ -96,7 +96,21 @@ async function renderFileView(fileId, tab) {
 
 function quickActions(file) {
   const actions = [];
-  if (can('documents.request')) actions.push(el('button', { class: 'btn sm secondary', onclick: () => requestDocModal(file) }, '📄 Request document'));
+  if (can('documents.request')) {
+    actions.push(el('button', { class: 'btn sm secondary', onclick: () => requestDocModal(file) }, '📄 Request document'));
+    actions.push(el('button', {
+      class: 'btn sm secondary',
+      onclick: async (e) => {
+        if (!(await confirmDialog('Email this client a summary of everything still outstanding? The same list is already in their portal.'))) return;
+        e.target.disabled = true;
+        try {
+          const res = await api.post(`/api/broker/files/${file.id}/request-outstanding`, {});
+          toast(`Sent — ${res.documents} outstanding document${res.documents === 1 ? '' : 's'} listed.`, 'good');
+        } catch (err) { toast(err.message, 'bad'); }
+        e.target.disabled = false;
+      },
+    }, '✉️ Email outstanding'));
+  }
   if (can('stage.change')) actions.push(el('button', { class: 'btn sm secondary', onclick: () => changeStageModal(file) }, '🚀 Change stage'));
   if (can('tasks.manage')) actions.push(el('button', { class: 'btn sm secondary', onclick: () => addTaskModal(file) }, '✅ Add task'));
   if (can('chat.send')) actions.push(el('button', { class: 'btn sm', onclick: () => goFile(file.id, 'messages') }, '💬 Message'));
@@ -145,7 +159,7 @@ function renderFileOverview(body, { file, applicants, next_step, attention, stag
             e.target.disabled = true;
             try {
               const res = await api.post(`/api/broker/applicants/${a.id}/invite`, {});
-              inviteLinkModal(res.activation_link);
+              credentialsModal(res);
             } catch (err) { toast(err.message, 'bad'); }
             e.target.disabled = false;
           },
@@ -209,11 +223,12 @@ function renderFileOverview(body, { file, applicants, next_step, attention, stag
   body.append(attentionCard, nextCard, appCard, applicantsCard, historyCard, adminCard);
 }
 
+/** Staff activation links (separate flow from client temporary passwords). */
 function inviteLinkModal(link) {
   const input = el('input', { type: 'text', value: link, readonly: true, onclick: (e) => e.target.select() });
-  openModal('Portal invitation sent',
+  openModal('Invitation sent',
     [
-      el('p', { class: 'muted' }, 'A welcome email with this activation link was recorded. You can also copy it and share it directly with the client:'),
+      el('p', { class: 'muted' }, 'A welcome email with this activation link was recorded. You can also copy it and share it directly:'),
       input,
     ],
     (close) => [
@@ -332,7 +347,7 @@ function applicantModal(file, applicant) {
             if (isNew) {
               payload.invite = invite.checked;
               const res = await api.post(`/api/broker/files/${file.id}/applicants`, payload);
-              if (res.invite && res.invite.activation_link) inviteLinkModal(res.invite.activation_link);
+              if (res.invite && res.invite.temporary_password) credentialsModal(res.invite);
             } else {
               await api.patch(`/api/broker/applicants/${a.id}`, payload);
             }
@@ -418,6 +433,27 @@ async function renderFileDocuments(body, file) {
     card.append(ul);
     body.append(card);
   }
+
+  // Documents removed for this client specifically — restorable without
+  // touching the brokerage's global defaults.
+  try {
+    const ex = await api.get(`/api/broker/files/${file.id}/checklist/exclusions`);
+    if (ex.exclusions.length) {
+      body.append(el('div', { class: 'card tight' },
+        el('div', { class: 'faint', style: 'margin-bottom:6px' },
+          'Removed for this client (your global defaults are unchanged):'),
+        el('div', { class: 'row wrap' }, ex.exclusions.map((e) => el('button', {
+          class: 'chip',
+          onclick: async () => {
+            try {
+              await api.post(`/api/broker/files/${file.id}/checklist/restore`, { document_type_id: e.document_type_id });
+              toast(`${e.document_name} restored.`, 'good');
+              renderFileView(file.id, 'documents');
+            } catch (err) { toast(err.message, 'bad'); }
+          },
+        }, `+ ${e.document_name}`)))));
+    }
+  } catch { /* non-fatal */ }
 }
 
 function brokerDocRow(file, r) {
@@ -481,7 +517,9 @@ function brokerDocRow(file, r) {
         r.client_comment ? el('div', { class: 'small', style: 'color:var(--warn)' }, `Client says: “${r.client_comment}”`) : null,
         r.internal_note ? el('div', { class: 'faint' }, `Internal: ${r.internal_note}`) : null,
         r.current_version ? el('div', { class: 'faint' }, `Current: ${r.current_version.display_name} (${fmtSize(r.current_version.size)}, ${fmtDateTime(r.current_version.uploaded_at)})`) : null,
-        r.reminder_count ? el('div', { class: 'faint' }, `${r.reminder_count} reminder${r.reminder_count > 1 ? 's' : ''} sent`) : null),
+        r.reminder_count ? el('div', { class: 'faint' }, `${r.reminder_count} reminder${r.reminder_count > 1 ? 's' : ''} sent`) : null,
+        aiReviewPanel(file, r),
+        storageBadge(r.current_version)),
       el('div', { class: 'row wrap', style: 'justify-content:flex-end' }, actions)),
     versions.length ? el('button', {
       class: 'btn-link small',
@@ -491,6 +529,82 @@ function brokerDocRow(file, r) {
       },
     }, `History (${versions.length})`) : null,
     versionsHolder);
+}
+
+/**
+ * Internal AI review summary. Brokerage-only: the client portal never
+ * receives this data, and the broker still makes every approve/reject call.
+ */
+function aiReviewPanel(file, r) {
+  const review = r.ai_review;
+  if (!review) return null;
+
+  if (review.status === 'pending' || review.status === 'running') {
+    return el('div', { class: 'ai-panel muted small' }, '🧠 AI review in progress…');
+  }
+  if (review.status === 'failed') {
+    return el('div', { class: 'ai-panel bad-tint small' },
+      el('div', null, `🧠 AI review failed: ${review.error || 'unknown error'}`),
+      can('documents.review') ? el('button', {
+        class: 'btn-link small',
+        onclick: async (e) => {
+          e.target.disabled = true;
+          try {
+            await api.post(`/api/broker/ai-reviews/${review.id}/retry`, {});
+            toast('Review queued for another attempt.', 'good');
+          } catch (err) { toast(err.message, 'bad'); }
+        },
+      }, 'Retry review') : null);
+  }
+  if (review.status !== 'done' || !review.result) return null;
+
+  const result = review.result;
+  const details = el('div', { class: 'hidden' },
+    result.extracted && Object.keys(result.extracted).length
+      ? el('table', { class: 'data', style: 'margin-top:6px' },
+          el('tbody', null, Object.entries(result.extracted).map(([k, v]) =>
+            el('tr', null,
+              el('td', { class: 'faint', style: 'width:45%' }, k.replace(/_/g, ' ')),
+              el('td', null, String(v))))))
+      : null,
+    (result.issues || []).length
+      ? el('ul', { style: 'margin:8px 0 0 18px' }, result.issues.map((i) => el('li', { class: 'small' }, i)))
+      : null,
+    result.suggested_action ? el('div', { class: 'small', style: 'margin-top:6px' }, `Suggested: ${result.suggested_action}`) : null
+  );
+
+  return el('div', { class: 'ai-panel' },
+    el('div', { class: 'row wrap' },
+      el('span', null, '🧠'),
+      el('span', { style: 'font-weight:600' }, 'AI review'),
+      el('span', { class: `pill ${result.matches_expected === false ? 'warn' : 'good'}` },
+        result.detected_type || 'reviewed'),
+      result.confidence ? el('span', { class: 'pill' }, `${result.confidence} confidence`) : null,
+      (result.issues || []).length ? el('span', { class: 'pill warn' }, `${result.issues.length} issue${result.issues.length > 1 ? 's' : ''}`) : null,
+      el('div', { class: 'spacer' }),
+      el('button', {
+        class: 'btn-link small',
+        onclick: (e) => {
+          details.classList.toggle('hidden');
+          e.target.textContent = details.classList.contains('hidden') ? 'Details' : 'Hide';
+        },
+      }, 'Details')),
+    result.summary ? el('div', { class: 'small muted', style: 'margin-top:2px' }, result.summary) : null,
+    details,
+    el('div', { class: 'faint', style: 'margin-top:4px' }, 'Internal only — never shown to the client. You decide approval.')
+  );
+}
+
+/** Where the original file lives in the brokerage's OneDrive. */
+function storageBadge(version) {
+  if (!version || !version.onedrive_status) return null;
+  if (version.onedrive_status === 'done') {
+    return el('div', { class: 'faint' }, `☁️ Stored in OneDrive: ${version.onedrive_path || ''}`);
+  }
+  if (version.onedrive_status === 'failed') {
+    return el('div', { class: 'faint', style: 'color:var(--bad)' }, `☁️ OneDrive copy failed: ${version.onedrive_error || ''}`);
+  }
+  return el('div', { class: 'faint' }, '☁️ Copying to OneDrive…');
 }
 
 function brokerUploadBtn(file, r) {

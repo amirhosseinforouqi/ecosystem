@@ -60,8 +60,8 @@ const PDF = Buffer.from('%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n
 
 let fileA;            // John Smith's file
 let fileB;            // Second client's file
-let activationA;
-let activationB;
+let credentialsA;       // { username, temporary_password } for John Smith
+let credentialsB;
 
 before(async () => {
   await new Promise((resolve) => server.listen(0, resolve));
@@ -98,11 +98,25 @@ test('scenario 1 — broker creates a client; file, checklist and welcome email 
   assert.match(fileA.file_number, /^MTG-\d{4}-\d{5}$/);
   assert.ok(fileA.checklist.total_required >= 4, 'checklist was generated');
 
-  activationA = res.data.invites.find((i) => i.activation_link).activation_link;
-  assert.ok(activationA.includes('/activate?token='));
+  // The system generated a username and a temporary password automatically.
+  credentialsA = res.data.invites.find((i) => i.temporary_password);
+  assert.ok(credentialsA, 'temporary credentials returned to the broker');
+  assert.strictEqual(credentialsA.username, 'john.smith@test.local', 'username is the client email');
+  assert.ok(credentialsA.temporary_password.length >= 12, 'temporary password is long');
+  assert.strictEqual(credentialsA.emailed, true, 'welcome email was sent automatically');
 
   const emails = await admin.get(`/api/broker/files/${fileA.id}/emails`);
-  assert.ok(emails.data.emails.some((e) => e.template_key === 'welcome' && e.status === 'sent'), 'welcome email sent');
+  const welcome = emails.data.emails.find((e) => e.template_key === 'welcome' && e.status === 'sent');
+  assert.ok(welcome, 'welcome email sent');
+
+  // The stored copy must never contain the temporary password in plaintext.
+  const detail = await admin.get(`/api/broker/emails/${welcome.id}`);
+  assert.ok(detail.data.email.body.includes(credentialsA.username), 'email contains the username');
+  assert.ok(detail.data.email.body.includes('/login'), 'email contains the portal link');
+  assert.ok(
+    !detail.data.email.body.includes(credentialsA.temporary_password),
+    'temporary password is redacted in the stored email log'
+  );
 });
 
 test('scenario 3 — the rule engine produced the right documents for Employee + Purchase', async () => {
@@ -113,15 +127,39 @@ test('scenario 3 — the rule engine produced the right documents for Employee +
   }
 });
 
-test('scenario 2 — client first login via activation link', async () => {
-  const token = new URL(activationA).searchParams.get('token');
-  const weak = await clientA.post('/api/auth/activate', { token, password: 'short' });
+test('scenario 2 — client logs in with temporary credentials and is forced to change them', async () => {
+  // Log in with the temporary password.
+  const login = await clientA.post('/api/auth/login', {
+    email: credentialsA.username, password: credentialsA.temporary_password,
+  });
+  assert.strictEqual(login.status, 200);
+  assert.strictEqual(login.data.redirect, '/change-password', 'sent straight to the password change screen');
+  assert.strictEqual(login.data.must_change_password, true);
+
+  // While the temporary password stands, no portal data is reachable.
+  const blocked = await clientA.get('/api/client/overview');
+  assert.strictEqual(blocked.status, 403);
+  assert.strictEqual(blocked.data.code, 'password_change_required');
+
+  // Weak replacements are rejected.
+  const weak = await clientA.post('/api/auth/change-password', {
+    current_password: credentialsA.temporary_password, new_password: 'short',
+  });
   assert.strictEqual(weak.status, 400, 'weak password rejected');
 
-  const res = await clientA.post('/api/auth/activate', { token, password: 'JohnPass123' });
-  assert.strictEqual(res.status, 200);
-  assert.strictEqual(res.data.redirect, '/portal');
+  // Reusing the temporary password as the new one is rejected.
+  const same = await clientA.post('/api/auth/change-password', {
+    current_password: credentialsA.temporary_password, new_password: credentialsA.temporary_password,
+  });
+  assert.strictEqual(same.status, 400, 'cannot keep the temporary password');
 
+  const changed = await clientA.post('/api/auth/change-password', {
+    current_password: credentialsA.temporary_password, new_password: 'JohnPass123',
+  });
+  assert.strictEqual(changed.status, 200);
+  assert.strictEqual(changed.data.redirect, '/portal');
+
+  // The portal is reachable now.
   const overview = await clientA.get('/api/client/overview');
   assert.strictEqual(overview.status, 200);
   assert.strictEqual(overview.data.files.length, 1);
@@ -129,8 +167,12 @@ test('scenario 2 — client first login via activation link', async () => {
   assert.ok(overview.data.files[0].needed.length >= 4, 'client sees needed documents');
   assert.ok(overview.data.files[0].next_step.text.length > 0, 'client sees a next step');
 
-  const reused = await makeClient().post('/api/auth/activate', { token, password: 'JohnPass123' });
-  assert.strictEqual(reused.status, 400, 'activation token is single-use');
+  // The temporary password no longer works anywhere.
+  const stale = makeClient();
+  const staleLogin = await stale.post('/api/auth/login', {
+    email: credentialsA.username, password: credentialsA.temporary_password,
+  });
+  assert.strictEqual(staleLogin.status, 401, 'temporary password is dead after the change');
 });
 
 test('scenario 4 — client uploads three documents; broker is notified', async () => {
@@ -253,9 +295,13 @@ test('scenario 10 — client isolation is enforced at the API level', async () =
   });
   assert.strictEqual(created.status, 200);
   fileB = created.data.file;
-  activationB = created.data.invites.find((i) => i.activation_link).activation_link;
-  const token = new URL(activationB).searchParams.get('token');
-  await clientB.post('/api/auth/activate', { token, password: 'SarahPass123' });
+  credentialsB = created.data.invites.find((i) => i.temporary_password);
+  await clientB.post('/api/auth/login', {
+    email: credentialsB.username, password: credentialsB.temporary_password,
+  });
+  await clientB.post('/api/auth/change-password', {
+    current_password: credentialsB.temporary_password, new_password: 'SarahPass123',
+  });
 
   // B's own overview never contains A's file.
   const overviewB = await clientB.get('/api/client/overview');

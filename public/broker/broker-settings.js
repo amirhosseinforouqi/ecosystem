@@ -5,13 +5,15 @@
 const SETTINGS_SECTIONS = [
   ['branding', 'Branding'],
   ['stages', 'Stages'],
-  ['types', 'Application types'],
-  ['doctypes', 'Document types'],
+  ['types', 'Client services'],
+  ['employment', 'Employment statuses'],
+  ['doctypes', 'Document catalog'],
   ['rules', 'Document rules'],
   ['templates', 'Email templates'],
   ['automation', 'Reminders & automation'],
   ['team', 'Team & permissions'],
   ['consents', 'Consent forms'],
+  ['integrations', 'Integrations'],
 ];
 
 async function renderSettings(section) {
@@ -33,8 +35,10 @@ async function renderSettings(section) {
 
   const renderers = {
     branding: renderBrandingSettings, stages: renderStageSettings, types: renderTypeSettings,
-    doctypes: renderDocTypeSettings, rules: renderRuleSettings, templates: renderTemplateSettings,
+    employment: renderEmploymentSettings, doctypes: renderDocTypeSettings,
+    rules: renderRuleSettings, templates: renderTemplateSettings,
     automation: renderAutomationSettings, team: renderTeamSettings, consents: renderConsentSettings,
+    integrations: renderIntegrationsSettings,
   };
   await (renderers[section] || renderBrandingSettings)(bodyEl);
 }
@@ -200,6 +204,95 @@ async function renderTypeSettings(body) {
         }, 'Add'))));
 }
 
+// ------------------------------------------------------------------ employment statuses
+
+async function renderEmploymentSettings(body) {
+  await reloadMeta();
+  const statuses = BK.meta.employment_statuses || [];
+  const nameInput = el('input', { type: 'text', placeholder: 'e.g. Gig Worker' });
+
+  async function move(index, delta) {
+    const ids = statuses.map((s) => s.id);
+    const [moved] = ids.splice(index, 1);
+    ids.splice(index + delta, 0, moved);
+    await api.post('/api/settings/employment-statuses/reorder', { ids });
+    renderSettings('employment');
+  }
+
+  body.append(
+    el('p', { class: 'muted' },
+      'Step 2 of the Add Client wizard offers these. Combined with the client service, they decide the default document checklist.'),
+    el('div', { class: 'card' },
+      el('ul', { class: 'list' }, statuses.map((s, i) => el('li', { class: 'row wrap' },
+        el('div', { class: 'grow', style: s.active ? 'font-weight:600' : 'color:var(--ink-faint)' },
+          s.name, s.active ? '' : el('span', { class: 'pill', style: 'margin-left:8px' }, 'Disabled')),
+        el('button', { class: 'btn sm secondary', disabled: i === 0 ? '' : undefined, onclick: () => move(i, -1) }, '↑'),
+        el('button', { class: 'btn sm secondary', disabled: i === statuses.length - 1 ? '' : undefined, onclick: () => move(i, 1) }, '↓'),
+        el('button', { class: 'btn sm secondary', onclick: () => employmentModal(s) }, 'Edit'),
+        el('button', {
+          class: 'btn sm secondary',
+          onclick: async () => {
+            await api.patch(`/api/settings/employment-statuses/${s.id}`, { active: !s.active });
+            renderSettings('employment');
+          },
+        }, s.active ? 'Disable' : 'Enable')))),
+      el('div', { class: 'row', style: 'margin-top:12px' },
+        nameInput,
+        el('button', {
+          class: 'btn',
+          onclick: async () => {
+            if (!nameInput.value.trim()) return;
+            try {
+              await api.post('/api/settings/employment-statuses', { name: nameInput.value });
+              renderSettings('employment');
+            } catch (err) { toast(err.message, 'bad'); }
+          },
+        }, 'Add'))));
+}
+
+function employmentModal(status) {
+  const name = el('input', { type: 'text', value: status.name });
+  openModal(`Edit: ${status.name}`,
+    el('label', { class: 'field' }, el('span', null, 'Name'), name),
+    (close) => [
+      el('button', { class: 'btn secondary', onclick: close }, 'Cancel'),
+      el('button', {
+        class: 'btn',
+        onclick: async () => {
+          await api.patch(`/api/settings/employment-statuses/${status.id}`, { name: name.value });
+          close(); renderSettings('employment');
+        },
+      }, 'Save'),
+    ]);
+}
+
+// ------------------------------------------------------------------ integrations
+
+async function renderIntegrationsSettings(body) {
+  await reloadMeta();
+  const i = BK.meta.integrations || {};
+  const row = (label, on, detail) => el('div', { class: 'card tight row wrap' },
+    el('span', { class: `pill ${on ? 'good' : 'warn'}` }, on ? 'Connected' : 'Not configured'),
+    el('div', { class: 'grow' },
+      el('div', { style: 'font-weight:600' }, label),
+      el('div', { class: 'faint' }, detail)));
+
+  body.append(
+    el('p', { class: 'muted' },
+      'These integrations are configured with server-side environment variables so credentials never reach the browser. See the README for the exact setup steps.'),
+    row('Microsoft 365 / Outlook email', i.microsoft_graph,
+      'Sends client email through your connected mailbox using Microsoft Graph and OAuth app credentials (MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_MAILBOX).'),
+    row('OneDrive document storage', i.onedrive,
+      'Stores every uploaded document in your OneDrive, organized per client file (ONEDRIVE_ROOT).'),
+    row('Claude document review', i.ai_review,
+      'Reviews uploads in the background with the document-review skill (ANTHROPIC_API_KEY, ANTHROPIC_MODEL).'),
+    el('div', { class: 'card tight row wrap' },
+      el('span', { class: 'pill' }, i.email_transport || 'log'),
+      el('div', { class: 'grow' },
+        el('div', { style: 'font-weight:600' }, 'Active email transport'),
+        el('div', { class: 'faint' }, 'graph = Microsoft 365 · smtp = mailbox app password · log/disabled = nothing is delivered'))));
+}
+
 // ------------------------------------------------------------------ document types
 
 async function renderDocTypeSettings(body) {
@@ -221,18 +314,31 @@ async function renderDocTypeSettings(body) {
         }, t.active ? 'Disable' : 'Enable'))))))));
 }
 
+const DOC_CATEGORIES = ['identity', 'credit', 'income', 'property', 'financial', 'corporate', 'other'];
+
 function docTypeModal(t) {
   const isNew = !t;
   const d = t || {};
   const name = el('input', { type: 'text', value: d.name || '' });
-  const category = el('select', null, ['identity', 'income', 'property', 'financial', 'other'].map((c) =>
+  const category = el('select', null, DOC_CATEGORIES.map((c) =>
     el('option', { value: c, selected: (d.category || 'other') === c ? '' : undefined }, c)));
-  const desc = el('textarea', null, d.description || '');
+  const desc = el('textarea', { placeholder: 'e.g. Get it from: https://my.equifax.ca/login' }, d.description || '');
+  const requirement = el('select', null,
+    el('option', { value: 'required', selected: (d.default_requirement || 'required') === 'required' ? '' : undefined }, 'Required by default'),
+    el('option', { value: 'optional', selected: d.default_requirement === 'optional' ? '' : undefined }, 'Optional by default'));
+  const perApplicant = el('input', { type: 'checkbox', checked: d.default_per_applicant ? '' : undefined });
+  const expires = el('input', { type: 'number', value: d.default_expires_days ?? '', placeholder: 'e.g. 60' });
+
   openModal(isNew ? 'Add document type' : `Edit ${d.name}`,
     el('div', null,
-      el('label', { class: 'field' }, el('span', null, 'Name'), name),
+      el('label', { class: 'field' }, el('span', null, 'Document name'), name),
       el('label', { class: 'field' }, el('span', null, 'Category'), category),
-      el('label', { class: 'field' }, el('span', null, 'Client-facing description'), desc)),
+      el('label', { class: 'field' }, el('span', null, 'Instructions shown to the client'), desc),
+      el('div', { class: 'form-row cols-2' },
+        el('label', { class: 'field' }, el('span', null, 'Default requirement'), requirement),
+        el('label', { class: 'field' }, el('span', null, 'Valid for (days after approval)'), expires)),
+      el('label', { class: 'checkbox' }, perApplicant, 'Applicant-specific by default (one per applicant)'),
+      el('p', { class: 'faint' }, 'These are catalog defaults. Each client\'s checklist can still be adjusted individually.')),
     (close) => [
       el('button', { class: 'btn secondary', onclick: close }, 'Cancel'),
       el('button', {
@@ -240,7 +346,12 @@ function docTypeModal(t) {
         onclick: async (e) => {
           e.target.disabled = true;
           try {
-            const payload = { name: name.value, category: category.value, description: desc.value };
+            const payload = {
+              name: name.value, category: category.value, description: desc.value,
+              default_requirement: requirement.value,
+              default_per_applicant: perApplicant.checked,
+              default_expires_days: expires.value || null,
+            };
             if (isNew) await api.post('/api/settings/document-types', payload);
             else await api.patch(`/api/settings/document-types/${d.id}`, payload);
             close(); renderSettings('doctypes');
@@ -411,12 +522,28 @@ function templateModal(t) {
 
   openModal(`Edit template: ${t.name}`,
     el('div', null,
+      t.key === 'welcome'
+        ? el('p', { class: 'faint' },
+            'Placeholders available here include {{username}}, {{temporary_password}}, {{portal_link}}, {{application_number}} and {{service_type}} — the system fills them in for each client before sending.')
+        : null,
       el('label', { class: 'field' }, el('span', null, 'Subject'), subject),
       el('label', { class: 'field' }, el('span', null, 'Body'), bodyText),
       el('label', { class: 'checkbox' }, active, 'Active (emails of this type are sent)'),
       el('button', { class: 'btn sm secondary', onclick: preview }, '👁 Preview with sample data'),
       previewHolder),
     (close) => [
+      el('button', {
+        class: 'btn secondary', style: 'margin-right:auto',
+        onclick: async () => {
+          if (!(await confirmDialog('Restore this template to the default wording? Your edits will be replaced.'))) return;
+          try {
+            const res = await api.post(`/api/settings/templates/${t.key}/reset`, {});
+            subject.value = res.template.subject;
+            bodyText.value = res.template.body;
+            toast('Default wording restored.', 'good');
+          } catch (err) { toast(err.message, 'bad'); }
+        },
+      }, 'Reset to default'),
       el('button', { class: 'btn secondary', onclick: close }, 'Cancel'),
       el('button', {
         class: 'btn',

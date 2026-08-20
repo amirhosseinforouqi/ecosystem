@@ -365,6 +365,78 @@ CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(email, attempted
 
 db.exec(SCHEMA);
 
+// ---------------------------------------------------------------------------
+// Lightweight migrations: additive schema evolution for existing databases.
+// CREATE TABLE IF NOT EXISTS covers new tables; ensureColumn covers columns
+// added to tables that already exist on disk.
+
+function ensureColumn(table, column, definition) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS employment_statuses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT UNIQUE,
+  name TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  sort INTEGER NOT NULL DEFAULT 0
+);
+
+-- Client-specific removals of rule-generated checklist items. This is what
+-- keeps a broker's per-client edits from being undone the next time the
+-- global rules are re-evaluated, and keeps global rules unchanged for
+-- every other client.
+CREATE TABLE IF NOT EXISTS checklist_exclusions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_id INTEGER NOT NULL REFERENCES client_files(id) ON DELETE CASCADE,
+  document_type_id INTEGER NOT NULL,
+  applicant_id INTEGER,
+  excluded_by INTEGER,
+  created_at TEXT NOT NULL,
+  UNIQUE (file_id, document_type_id, applicant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_exclusions_file ON checklist_exclusions(file_id);
+
+CREATE TABLE IF NOT EXISTS ai_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id INTEGER NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+  request_id INTEGER NOT NULL,
+  file_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  model TEXT,
+  result TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ai_reviews_status ON ai_reviews(status);
+CREATE INDEX IF NOT EXISTS idx_ai_reviews_version ON ai_reviews(version_id);
+`);
+
+// Temporary-password / forced-change flow.
+ensureColumn('users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
+// Document catalog defaults used when a document is added manually.
+ensureColumn('document_types', 'default_requirement', "TEXT NOT NULL DEFAULT 'required'");
+ensureColumn('document_types', 'default_per_applicant', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('document_types', 'default_expires_days', 'INTEGER');
+// OneDrive sync state for client folders and uploaded files.
+ensureColumn('client_files', 'onedrive_folder_id', 'TEXT');
+ensureColumn('client_files', 'onedrive_folder_path', 'TEXT');
+ensureColumn('client_files', 'onedrive_status', 'TEXT');
+ensureColumn('client_files', 'onedrive_attempts', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('client_files', 'onedrive_error', 'TEXT');
+ensureColumn('document_versions', 'onedrive_item_id', 'TEXT');
+ensureColumn('document_versions', 'onedrive_path', 'TEXT');
+ensureColumn('document_versions', 'onedrive_status', 'TEXT');
+ensureColumn('document_versions', 'onedrive_attempts', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('document_versions', 'onedrive_error', 'TEXT');
+
 function run(sql, ...params) {
   return db.prepare(sql).run(...params);
 }

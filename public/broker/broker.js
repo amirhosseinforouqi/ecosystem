@@ -16,6 +16,10 @@ async function boot() {
     window.location.href = '/login';
     return;
   }
+  if (BK.me.must_change_password) {
+    window.location.href = '/change-password';
+    return;
+  }
   if (!BK.me.is_staff) {
     window.location.href = '/portal';
     return;
@@ -327,41 +331,316 @@ async function renderClients() {
 
 // ------------------------------------------------------------------ new client
 
+/**
+ * Guided Add Client wizard.
+ *
+ * Step 1 service → Step 2 employment → Step 3 the checklist the rules
+ * generate (which the broker edits for THIS client only) → Step 4 client
+ * details → create. Wizard state lives here; nothing is written until the
+ * final step, and edits to the checklist never touch the global rules.
+ */
+const wiz = {
+  step: 1,
+  service: null,        // application_types row
+  employment: null,     // employment_statuses row
+  fthb: false,
+  checklist: [],        // [{ document_type_id, document_name, category, requirement, instructions, due_date }]
+  removed: [],          // defaults the broker took off this client's list
+  client: {},
+  coApplicants: [],
+  creating: false,
+};
+
+function resetWizard() {
+  wiz.step = 1;
+  wiz.service = null;
+  wiz.employment = null;
+  wiz.fthb = false;
+  wiz.checklist = [];
+  wiz.removed = [];
+  wiz.client = {};
+  wiz.coApplicants = [];
+  wiz.creating = false;
+}
+
+function wizardHeader() {
+  const steps = ['Service', 'Employment', 'Documents', 'Client details'];
+  return el('div', { class: 'wiz-steps' }, steps.map((label, i) => {
+    const n = i + 1;
+    return el('div', { class: `wiz-step ${n < wiz.step ? 'done' : n === wiz.step ? 'now' : ''}` },
+      el('div', { class: 'bubble' }, n < wiz.step ? '✓' : String(n)),
+      el('div', { class: 'lbl' }, label));
+  }));
+}
+
 function renderNewClient() {
   if (!can('clients.create')) {
     setView(el('div', { class: 'card empty' }, el('p', null, 'You do not have permission to create clients.')));
     return;
   }
+  if (wiz.step === 1) return wizardStepService();
+  if (wiz.step === 2) return wizardStepEmployment();
+  if (wiz.step === 3) return wizardStepDocuments();
+  return wizardStepDetails();
+}
+
+// ------------------------------------------------------------- step 1
+
+function wizardStepService() {
+  const services = BK.meta.application_types.filter((t) => t.active);
+  setView(
+    el('h1', null, 'New client'),
+    wizardHeader(),
+    el('div', { class: 'card' },
+      el('h2', null, 'What type of service does this client need?'),
+      el('p', { class: 'muted' }, 'This drives the documents we ask for. You can change it later.'),
+      services.length === 0
+        ? el('p', { class: 'muted' }, 'No services are configured yet. Add them under Settings → Client services.')
+        : el('div', { class: 'choice-grid' }, services.map((s) =>
+            el('button', {
+              class: `choice ${wiz.service && wiz.service.id === s.id ? 'selected' : ''}`,
+              onclick: () => { wiz.service = s; wiz.step = 2; renderNewClient(); },
+            },
+              el('span', { class: 'choice-name' }, s.name),
+              el('span', { class: 'choice-go' }, '→')))),
+      el('div', { class: 'row', style: 'margin-top:14px' },
+        el('a', { class: 'btn secondary', href: '#/clients', onclick: resetWizard }, 'Cancel')))
+  );
+}
+
+// ------------------------------------------------------------- step 2
+
+function wizardStepEmployment() {
+  const statuses = (BK.meta.employment_statuses || []).filter((s) => s.active);
+  setView(
+    el('h1', null, 'New client'),
+    wizardHeader(),
+    el('div', { class: 'card' },
+      el('div', { class: 'row' },
+        el('h2', { class: 'grow' }, "What is the client's employment status?"),
+        el('span', { class: 'pill brand' }, wiz.service.name)),
+      el('p', { class: 'muted' }, 'Combined with the service, this decides the default document checklist.'),
+      statuses.length === 0
+        ? el('p', { class: 'muted' }, 'No employment statuses are configured yet. Add them under Settings → Employment statuses.')
+        : el('div', { class: 'choice-grid' }, statuses.map((s) =>
+            el('button', {
+              class: `choice ${wiz.employment && wiz.employment.id === s.id ? 'selected' : ''}`,
+              onclick: () => { wiz.employment = s; wiz.step = 3; loadWizardChecklist(); },
+            },
+              el('span', { class: 'choice-name' }, s.name),
+              el('span', { class: 'choice-go' }, '→')))),
+      el('label', { class: 'checkbox', style: 'margin-top:14px' },
+        el('input', {
+          type: 'checkbox', checked: wiz.fthb ? '' : undefined,
+          onchange: (e) => { wiz.fthb = e.target.checked; },
+        }), 'This is a first-time home buyer'),
+      el('div', { class: 'row', style: 'margin-top:14px' },
+        el('button', { class: 'btn secondary', onclick: () => { wiz.step = 1; renderNewClient(); } }, '← Back')))
+  );
+}
+
+// ------------------------------------------------------------- step 3
+
+async function loadWizardChecklist() {
+  setView(el('h1', null, 'New client'), wizardHeader(),
+    el('div', { class: 'card' }, el('div', { class: 'skeleton', style: 'height:180px' })));
+  try {
+    const params = new URLSearchParams({
+      application_type_id: wiz.service.id,
+      employment_type: wiz.employment.key,
+      fthb: wiz.fthb ? '1' : '0',
+    });
+    const res = await api.get(`/api/broker/checklist-preview?${params}`);
+    wiz.checklist = res.documents.map((d) => ({
+      document_type_id: d.document_type_id,
+      document_name: d.document_name,
+      category: d.category,
+      requirement: d.requirement,
+      instructions: d.instructions || '',
+      due_date: '',
+      from_rule: true,
+    }));
+    wiz.removed = [];
+  } catch (err) {
+    toast(err.message, 'bad');
+    wiz.checklist = [];
+  }
+  wizardStepDocuments();
+}
+
+const CATEGORY_LABEL = {
+  identity: 'Identity', credit: 'Credit', income: 'Income / Tax',
+  property: 'Property', financial: 'Assets', corporate: 'Corporate', other: 'Other',
+};
+
+function wizardStepDocuments() {
+  const byCategory = new Map();
+  for (const doc of wiz.checklist) {
+    const key = doc.category || 'other';
+    if (!byCategory.has(key)) byCategory.set(key, []);
+    byCategory.get(key).push(doc);
+  }
+
+  const groups = [...byCategory.entries()].map(([category, docs]) =>
+    el('div', { class: 'doc-group' },
+      el('div', { class: 'doc-group-title' }, CATEGORY_LABEL[category] || category),
+      el('ul', { class: 'list' }, docs.map((doc) => el('li', { class: 'row top wrap' },
+        el('div', { class: 'grow' },
+          el('div', { class: 'row wrap' },
+            el('span', { style: 'font-weight:600' }, doc.document_name),
+            doc.requirement === 'optional' ? el('span', { class: 'pill' }, 'Optional') : null,
+            doc.from_rule ? null : el('span', { class: 'pill brand' }, 'Added')),
+          doc.instructions
+            ? el('div', { class: 'small muted', style: 'margin-top:2px' }, doc.instructions)
+            : null),
+        el('div', { class: 'row' },
+          el('button', { class: 'btn sm secondary', onclick: () => editWizardDoc(doc) }, 'Edit'),
+          el('button', {
+            class: 'btn sm secondary', style: 'color:var(--bad)',
+            onclick: () => {
+              wiz.checklist = wiz.checklist.filter((d) => d !== doc);
+              if (doc.from_rule) wiz.removed.push(doc);
+              wizardStepDocuments();
+            },
+          }, 'Remove'))
+      ))))
+  );
+
+  const restore = wiz.removed.length ? el('div', { class: 'card tight' },
+    el('div', { class: 'faint', style: 'margin-bottom:6px' }, 'Removed for this client (global defaults are unchanged):'),
+    el('div', { class: 'row wrap' }, wiz.removed.map((doc) =>
+      el('button', {
+        class: 'chip',
+        onclick: () => {
+          wiz.removed = wiz.removed.filter((d) => d !== doc);
+          wiz.checklist.push(doc);
+          wizardStepDocuments();
+        },
+      }, `+ ${doc.document_name}`)))) : null;
+
+  setView(
+    el('h1', null, 'New client'),
+    wizardHeader(),
+    el('div', { class: 'card' },
+      el('div', { class: 'row wrap' },
+        el('h2', { class: 'grow' }, 'Documents required'),
+        el('span', { class: 'pill brand' }, wiz.service.name),
+        el('span', { class: 'pill' }, wiz.employment.name),
+        wiz.fthb ? el('span', { class: 'pill' }, 'First-time buyer') : null),
+      el('p', { class: 'muted' },
+        `${wiz.checklist.length} document${wiz.checklist.length === 1 ? '' : 's'} selected automatically from your document rules. Adjust them for this client — your global defaults stay as they are.`),
+      wiz.checklist.length === 0
+        ? el('div', { class: 'empty', style: 'padding:18px' },
+            el('p', null, 'No documents are configured for this combination yet. Add them below, or set up a rule under Settings → Document rules.'))
+        : el('div', null, groups),
+      el('button', { class: 'btn subtle', style: 'margin-top:10px', onclick: addWizardDocModal }, '+ Add document')),
+    restore,
+    el('div', { class: 'row' },
+      el('button', { class: 'btn secondary', onclick: () => { wiz.step = 2; renderNewClient(); } }, '← Back'),
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn', onclick: () => { wiz.step = 4; renderNewClient(); } }, 'Continue to client details →'))
+  );
+}
+
+function editWizardDoc(doc) {
+  const requirement = el('select', null,
+    el('option', { value: 'required', selected: doc.requirement === 'required' ? '' : undefined }, 'Required'),
+    el('option', { value: 'optional', selected: doc.requirement === 'optional' ? '' : undefined }, 'Optional'));
+  const instructions = el('textarea', { placeholder: 'What the client should know about this document' }, doc.instructions || '');
+  const due = el('input', { type: 'date', value: doc.due_date || '' });
+  openModal(`Edit: ${doc.document_name}`,
+    el('div', null,
+      el('label', { class: 'field' }, el('span', null, 'Required or optional'), requirement),
+      el('label', { class: 'field' }, el('span', null, 'Instructions shown to the client'), instructions),
+      el('label', { class: 'field' }, el('span', null, 'Due date (optional)'), due),
+      el('p', { class: 'faint' }, 'These changes apply to this client only.')),
+    (close) => [
+      el('button', { class: 'btn secondary', onclick: close }, 'Cancel'),
+      el('button', {
+        class: 'btn',
+        onclick: () => {
+          doc.requirement = requirement.value;
+          doc.instructions = instructions.value;
+          doc.due_date = due.value;
+          close();
+          wizardStepDocuments();
+        },
+      }, 'Save'),
+    ]);
+}
+
+function addWizardDocModal() {
+  const search = el('input', { type: 'search', placeholder: 'Search the document catalog…', autocomplete: 'off' });
+  const results = el('div', { style: 'max-height:46vh;overflow-y:auto' });
+
+  async function run() {
+    const res = await api.get(`/api/settings/document-types/search?q=${encodeURIComponent(search.value.trim())}`);
+    clearNode(results);
+    const chosen = new Set(wiz.checklist.map((d) => d.document_type_id));
+    const list = res.document_types.filter((t) => !chosen.has(t.id));
+    if (list.length === 0) {
+      results.append(el('p', { class: 'muted' }, 'No other documents match. Admins can create new document types under Settings → Document catalog.'));
+      return;
+    }
+    for (const t of list) {
+      results.append(el('div', { class: 'card tight row' },
+        el('div', { class: 'grow' },
+          el('div', { style: 'font-weight:600' }, t.name),
+          el('div', { class: 'faint' }, CATEGORY_LABEL[t.category] || t.category),
+          t.description ? el('div', { class: 'small muted' }, t.description) : null),
+        el('button', {
+          class: 'btn sm',
+          onclick: (e) => {
+            wiz.checklist.push({
+              document_type_id: t.id,
+              document_name: t.name,
+              category: t.category,
+              requirement: t.default_requirement === 'optional' ? 'optional' : 'required',
+              instructions: t.description || '',
+              due_date: '',
+              from_rule: false,
+            });
+            e.target.closest('.modal-backdrop').remove();
+            wizardStepDocuments();
+          },
+        }, 'Add')));
+    }
+  }
+  search.addEventListener('input', debounce(run, 200));
+  openModal('Add a document', el('div', null, search, el('div', { style: 'height:10px' }), results),
+    (close) => [el('button', { class: 'btn secondary', onclick: close }, 'Done')]);
+  run();
+}
+
+// ------------------------------------------------------------- step 4
+
+function wizardStepDetails() {
   const f = {
-    first_name: el('input', { type: 'text', autocomplete: 'off' }),
-    middle_name: el('input', { type: 'text' }),
-    last_name: el('input', { type: 'text' }),
-    preferred_name: el('input', { type: 'text', placeholder: 'What they like to be called' }),
-    email: el('input', { type: 'email' }),
-    phone: el('input', { type: 'tel' }),
-    dob: el('input', { type: 'date' }),
-    address: el('input', { type: 'text' }),
+    first_name: el('input', { type: 'text', value: wiz.client.first_name || '' }),
+    middle_name: el('input', { type: 'text', value: wiz.client.middle_name || '' }),
+    last_name: el('input', { type: 'text', value: wiz.client.last_name || '' }),
+    preferred_name: el('input', { type: 'text', value: wiz.client.preferred_name || '', placeholder: 'What they like to be called' }),
+    email: el('input', { type: 'email', value: wiz.client.email || '' }),
+    phone: el('input', { type: 'tel', value: wiz.client.phone || '' }),
+    dob: el('input', { type: 'date', value: wiz.client.dob || '' }),
+    address: el('input', { type: 'text', value: wiz.client.address || '' }),
     preferred_contact: el('select', null, [['email', 'Email'], ['phone', 'Phone call'], ['text', 'Text message'], ['portal', 'Portal messages']].map(([v, l]) => el('option', { value: v }, l))),
-    employment_type: el('select', null, [['', 'Not set'], ['employee', 'Employee'], ['self_employed', 'Self-employed'], ['retired', 'Retired'], ['unemployed', 'Not employed'], ['other', 'Other']].map(([v, l]) => el('option', { value: v }, l))),
-    employer_name: el('input', { type: 'text' }),
-    job_title: el('input', { type: 'text' }),
+    employer_name: el('input', { type: 'text', value: wiz.client.employer_name || '' }),
+    job_title: el('input', { type: 'text', value: wiz.client.job_title || '' }),
   };
   const a = {
-    application_type_id: el('select', null, BK.meta.application_types.filter((t) => t.active).map((t) => el('option', { value: t.id }, t.name))),
     purchase_price: el('input', { type: 'number', step: '1000', placeholder: '800000' }),
     down_payment: el('input', { type: 'number', step: '1000', placeholder: '160000' }),
     mortgage_amount: el('input', { type: 'number', step: '1000' }),
     property_address: el('input', { type: 'text' }),
     property_type: el('input', { type: 'text', placeholder: 'e.g. Detached, Condo' }),
     closing_date: el('input', { type: 'date' }),
-    fthb: el('input', { type: 'checkbox' }),
-    purpose: el('textarea', { placeholder: 'Purpose of financing / anything worth noting' }),
+    purpose: el('textarea', { placeholder: 'Anything worth noting about this application' }),
     assigned_broker_id: el('select', null, BK.staff.map((s) =>
       el('option', { value: s.id, selected: s.id === BK.me.user.id ? '' : undefined }, `${s.first_name} ${s.last_name}`))),
   };
   const sendWelcome = el('input', { type: 'checkbox', checked: '' });
 
-  // Auto-suggest mortgage amount from price - down payment.
   const suggestAmount = () => {
     const p = Number(a.purchase_price.value), d = Number(a.down_payment.value);
     if (p > 0 && d >= 0 && !a.mortgage_amount.dataset.touched) a.mortgage_amount.value = Math.max(0, p - d);
@@ -371,7 +650,6 @@ function renderNewClient() {
   a.mortgage_amount.addEventListener('input', () => { a.mortgage_amount.dataset.touched = '1'; });
 
   const coHolder = el('div');
-  const coApplicants = [];
   function addCoApplicant() {
     const co = {
       role: el('select', null, [['co_borrower', 'Co-borrower'], ['spouse', 'Spouse'], ['partner', 'Partner'], ['guarantor', 'Guarantor'], ['other', 'Other']].map(([v, l]) => el('option', { value: v }, l))),
@@ -379,8 +657,7 @@ function renderNewClient() {
       last_name: el('input', { type: 'text' }),
       email: el('input', { type: 'email' }),
       phone: el('input', { type: 'tel' }),
-      employment_type: el('select', null, [['', 'Not set'], ['employee', 'Employee'], ['self_employed', 'Self-employed'], ['retired', 'Retired'], ['unemployed', 'Not employed'], ['other', 'Other']].map(([v, l]) => el('option', { value: v }, l))),
-      employer_name: el('input', { type: 'text' }),
+      employment_type: el('select', null, (BK.meta.employment_statuses || []).filter((s) => s.active).map((s) => el('option', { value: s.key }, s.name))),
       invite: el('input', { type: 'checkbox' }),
       removed: false,
     };
@@ -395,39 +672,57 @@ function renderNewClient() {
       el('div', { class: 'form-row cols-2' },
         el('label', { class: 'field' }, el('span', null, 'Email'), co.email),
         el('label', { class: 'field' }, el('span', null, 'Phone'), co.phone)),
-      el('div', { class: 'form-row cols-2' },
-        el('label', { class: 'field' }, el('span', null, 'Employment'), co.employment_type),
-        el('label', { class: 'field' }, el('span', null, 'Employer'), co.employer_name)),
+      el('label', { class: 'field' }, el('span', null, 'Employment'), co.employment_type),
       el('label', { class: 'checkbox' }, co.invite, 'Give them their own portal access'));
-    coApplicants.push(co);
+    wiz.coApplicants.push(co);
     coHolder.append(card);
   }
 
   const errorLine = el('p', { class: 'form-error' });
-  const submitBtn = el('button', { class: 'btn' }, 'Create client & send welcome');
+  const submitBtn = el('button', { class: 'btn' }, 'Create client & send welcome email');
 
   async function submit(ignoreDuplicates) {
     errorLine.textContent = '';
     submitBtn.disabled = true;
     const payload = {
-      client: Object.fromEntries(Object.entries(f).map(([k, input]) => [k, input.value])),
-      application: {
-        ...Object.fromEntries(Object.entries(a).map(([k, input]) => [k, input.type === 'checkbox' ? input.checked : input.value])),
+      client: {
+        ...Object.fromEntries(Object.entries(f).map(([k, input]) => [k, input.value])),
+        employment_type: wiz.employment.key,
       },
-      co_applicants: coApplicants.filter((c) => !c.removed).map((c) => ({
+      application: {
+        application_type_id: wiz.service.id,
+        fthb: wiz.fthb,
+        purchase_price: a.purchase_price.value,
+        down_payment: a.down_payment.value,
+        mortgage_amount: a.mortgage_amount.value,
+        property_address: a.property_address.value,
+        property_type: a.property_type.value,
+        closing_date: a.closing_date.value,
+        purpose: a.purpose.value,
+        assigned_broker_id: a.assigned_broker_id.value,
+      },
+      checklist: wiz.checklist.map((d) => ({
+        document_type_id: d.document_type_id,
+        requirement: d.requirement,
+        instructions: d.instructions,
+        due_date: d.due_date || null,
+      })),
+      co_applicants: wiz.coApplicants.filter((c) => !c.removed).map((c) => ({
         role: c.role.value, first_name: c.first_name.value, last_name: c.last_name.value,
         email: c.email.value, phone: c.phone.value, employment_type: c.employment_type.value,
-        employer_name: c.employer_name.value, invite: c.invite.checked,
+        invite: c.invite.checked,
       })),
       send_welcome: sendWelcome.checked,
       ignore_duplicates: !!ignoreDuplicates,
     };
     try {
       const res = await api.post('/api/broker/clients', payload);
-      toast(`Client created — file ${res.file.file_number}. Checklist and welcome email are ready.`, 'good');
-      const invite = (res.invites || []).find((i) => i.activation_link);
-      if (invite) inviteLinkModal(invite.activation_link);
-      goFile(res.file.id);
+      const fileId = res.file.id;
+      const creds = (res.invites || []).find((i) => i.temporary_password);
+      toast(`Client created — file ${res.file.file_number}.`, 'good');
+      resetWizard();
+      if (creds) credentialsModal(creds, () => goFile(fileId));
+      else goFile(fileId);
     } catch (err) {
       if (err.status === 409 && err.data && err.data.duplicates) {
         duplicateModal(err.data.duplicates);
@@ -446,7 +741,7 @@ function renderNewClient() {
           el('div', { class: 'grow' },
             el('div', { style: 'font-weight:600' }, d.name),
             el('div', { class: 'faint' }, `${d.file_number} · ${d.reasons.join(', ')}`)),
-          el('button', { class: 'btn sm secondary', onclick: () => goFile(d.file_id) }, 'Open file')))),
+          el('button', { class: 'btn sm secondary', onclick: () => { resetWizard(); goFile(d.file_id); } }, 'Open file')))),
       (close) => [
         el('button', { class: 'btn secondary', onclick: close }, 'Cancel'),
         el('button', { class: 'btn', onclick: () => { close(); submit(true); } }, 'Create new file anyway'),
@@ -457,9 +752,16 @@ function renderNewClient() {
 
   setView(
     el('h1', null, 'New client'),
-    el('p', { class: 'muted' }, 'One quick form. The file, document checklist and welcome email are created automatically.'),
+    wizardHeader(),
+    el('div', { class: 'card tight row wrap' },
+      el('span', { class: 'pill brand' }, wiz.service.name),
+      el('span', { class: 'pill' }, wiz.employment.name),
+      wiz.fthb ? el('span', { class: 'pill' }, 'First-time buyer') : null,
+      el('span', { class: 'pill good' }, `${wiz.checklist.length} document${wiz.checklist.length === 1 ? '' : 's'}`),
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn-link small', onclick: () => { wiz.step = 3; renderNewClient(); } }, 'Edit checklist')),
     el('div', { class: 'card' },
-      el('h3', null, 'Primary client'),
+      el('h3', null, 'Client details'),
       el('div', { class: 'form-row cols-3' },
         el('label', { class: 'field' }, el('span', null, 'First name *'), f.first_name),
         el('label', { class: 'field' }, el('span', null, 'Middle name'), f.middle_name),
@@ -468,38 +770,66 @@ function renderNewClient() {
         el('label', { class: 'field' }, el('span', null, 'Preferred name'), f.preferred_name),
         el('label', { class: 'field' }, el('span', null, 'Date of birth'), f.dob)),
       el('div', { class: 'form-row cols-2' },
-        el('label', { class: 'field' }, el('span', null, 'Email'), f.email),
+        el('label', { class: 'field' }, el('span', null, 'Email *'), f.email),
         el('label', { class: 'field' }, el('span', null, 'Mobile phone'), f.phone)),
+      el('p', { class: 'faint' }, 'The email address becomes the client\'s portal username.'),
       el('label', { class: 'field' }, el('span', null, 'Current address'), f.address),
-      el('div', { class: 'form-row cols-2' },
-        el('label', { class: 'field' }, el('span', null, 'Preferred contact method'), f.preferred_contact),
-        el('label', { class: 'field' }, el('span', null, 'Employment'), f.employment_type)),
-      el('div', { class: 'form-row cols-2' },
+      el('div', { class: 'form-row cols-3' },
+        el('label', { class: 'field' }, el('span', null, 'Preferred contact'), f.preferred_contact),
         el('label', { class: 'field' }, el('span', null, 'Employer'), f.employer_name),
         el('label', { class: 'field' }, el('span', null, 'Job title'), f.job_title))),
     el('div', { class: 'card' },
       el('h3', null, 'Application'),
-      el('div', { class: 'form-row cols-2' },
-        el('label', { class: 'field' }, el('span', null, 'Application type'), a.application_type_id),
-        el('label', { class: 'field' }, el('span', null, 'Assigned broker'), a.assigned_broker_id)),
       el('div', { class: 'form-row cols-3' },
         el('label', { class: 'field' }, el('span', null, 'Purchase price'), a.purchase_price),
         el('label', { class: 'field' }, el('span', null, 'Down payment'), a.down_payment),
         el('label', { class: 'field' }, el('span', null, 'Mortgage amount'), a.mortgage_amount)),
       el('label', { class: 'field' }, el('span', null, 'Property address'), a.property_address),
-      el('div', { class: 'form-row cols-2' },
+      el('div', { class: 'form-row cols-3' },
         el('label', { class: 'field' }, el('span', null, 'Property type'), a.property_type),
-        el('label', { class: 'field' }, el('span', null, 'Closing date (if known)'), a.closing_date)),
-      el('label', { class: 'checkbox' }, a.fthb, 'First-time home buyer'),
+        el('label', { class: 'field' }, el('span', null, 'Closing date'), a.closing_date),
+        el('label', { class: 'field' }, el('span', null, 'Assigned broker'), a.assigned_broker_id)),
       el('label', { class: 'field' }, el('span', null, 'Notes'), a.purpose)),
     coHolder,
     el('div', { class: 'card' },
       el('button', { class: 'btn secondary', onclick: addCoApplicant }, '+ Add co-borrower / spouse / guarantor')),
     el('div', { class: 'card' },
-      el('label', { class: 'checkbox' }, sendWelcome, 'Send the welcome email with portal access now'),
-      el('p', { class: 'faint' }, 'The document checklist is generated automatically from your document rules (application type + employment + first-time buyer status).'),
+      el('label', { class: 'checkbox' }, sendWelcome, 'Email the welcome message with portal credentials now'),
+      el('p', { class: 'faint' }, 'The portal account and a secure temporary password are created automatically. The client must change it on first sign-in.'),
       errorLine,
-      el('div', { class: 'row' }, submitBtn, el('a', { class: 'btn secondary', href: '#/clients' }, 'Cancel'))));
+      el('div', { class: 'row' },
+        el('button', { class: 'btn secondary', onclick: () => { wiz.step = 3; renderNewClient(); } }, '← Back'),
+        el('div', { class: 'spacer' }),
+        submitBtn))
+  );
+}
+
+/** Show the generated credentials once, so the broker can relay them if needed. */
+function credentialsModal(creds, onClose) {
+  openModal('Portal account created',
+    el('div', null,
+      el('p', { class: 'muted' }, creds.emailed
+        ? 'The welcome email with these credentials has been sent. This is the only time the temporary password is shown here — it is stored only as a hash.'
+        : 'Automatic sending is off, so share these with the client yourself. This is the only time the temporary password is shown — it is stored only as a hash.'),
+      el('div', { class: 'card tight' },
+        el('div', { class: 'faint' }, 'Portal'),
+        el('div', { style: 'font-weight:600;margin-bottom:8px' }, creds.portal_link || '/login'),
+        el('div', { class: 'faint' }, 'Username'),
+        el('div', { style: 'font-weight:600;margin-bottom:8px' }, creds.username),
+        el('div', { class: 'faint' }, 'Temporary password'),
+        el('div', { style: 'font-weight:700;font-family:ui-monospace,monospace;font-size:1.05rem' }, creds.temporary_password)),
+      el('p', { class: 'faint' }, 'The client is required to choose their own password the first time they sign in.')),
+    (close) => [
+      el('button', {
+        class: 'btn secondary',
+        onclick: () => {
+          navigator.clipboard?.writeText(
+            `Portal: ${creds.portal_link}\nUsername: ${creds.username}\nTemporary password: ${creds.temporary_password}`
+          ).then(() => toast('Copied.', 'good'));
+        },
+      }, 'Copy details'),
+      el('button', { class: 'btn', onclick: () => { close(); if (onClose) onClose(); } }, 'Done'),
+    ]);
 }
 
 // ------------------------------------------------------------------ tasks page

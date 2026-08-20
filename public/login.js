@@ -21,13 +21,63 @@
     if (line) line.textContent = message || '';
   }
 
-  // Already signed in? Go straight home.
+  // Already signed in? Go straight home (which is the forced password
+  // change screen when a temporary password is still in effect).
   if (path === '/' || path === '/login') {
     try {
       const me = await api.get('/api/auth/me');
       window.location.href = me.home;
       return;
     } catch { /* not signed in — show the form */ }
+  }
+
+  // ------------------------------------------- forced password change
+  async function forcedChangeForm() {
+    let me;
+    try {
+      me = await api.get('/api/auth/me');
+    } catch {
+      window.location.href = '/login';
+      return;
+    }
+    if (!me.must_change_password) {
+      window.location.href = me.home;
+      return;
+    }
+    const current = el('input', { type: 'password', autocomplete: 'current-password', required: true, placeholder: 'The password from your welcome email' });
+    const password = el('input', { type: 'password', autocomplete: 'new-password', required: true, placeholder: 'At least 8 characters' });
+    const confirm = el('input', { type: 'password', autocomplete: 'new-password', required: true, placeholder: 'Repeat your new password' });
+    const submit = el('button', { class: 'btn block', type: 'submit' }, 'Save my new password');
+    const form = el('form', {
+      onsubmit: async (e) => {
+        e.preventDefault();
+        setError('');
+        if (password.value !== confirm.value) {
+          setError('The two passwords do not match.');
+          return;
+        }
+        submit.disabled = true;
+        try {
+          const res = await api.post('/api/auth/change-password', {
+            current_password: current.value, new_password: password.value,
+          });
+          window.location.href = res.redirect || '/portal';
+        } catch (err) {
+          setError(err.message);
+          submit.disabled = false;
+        }
+      },
+    },
+      el('h1', { class: 'auth-title' }, `Welcome${me.user.first_name ? ', ' + me.user.first_name : ''}!`),
+      el('p', { class: 'auth-sub' }, 'For your security, please replace the temporary password from your welcome email with one only you know.'),
+      el('label', { class: 'field' }, el('span', null, 'Temporary password'), current),
+      el('label', { class: 'field' }, el('span', null, 'New password'), password),
+      el('label', { class: 'field' }, el('span', null, 'Confirm new password'), confirm),
+      el('p', { class: 'faint' }, 'Use at least 8 characters, with at least one letter and one number.'),
+      errorLine(),
+      submit
+    );
+    show(form);
   }
 
   // ---------------------------------------------------------------- login
@@ -152,5 +202,6 @@
 
   if (path === '/activate') tokenForm('activate');
   else if (path === '/reset') tokenForm('reset');
+  else if (path === '/change-password') forcedChangeForm();
   else loginForm();
 })();

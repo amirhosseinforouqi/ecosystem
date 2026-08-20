@@ -12,7 +12,8 @@ const manage = requirePermission('settings.manage');
 const manageUsers = requirePermission('users.manage');
 
 const EDITABLE_CONFIG_KEYS = [
-  'brokerage', 'client_steps', 'reminders', 'automation', 'uploads', 'security', 'retention', 'role_permissions',
+  'brokerage', 'client_steps', 'reminders', 'automation', 'uploads', 'security', 'retention',
+  'role_permissions', 'notifications',
 ];
 
 function register(router) {
@@ -20,10 +21,60 @@ function register(router) {
   router.get('/api/settings/meta', requireStaff, () => ({
     stages: all('SELECT * FROM stages ORDER BY sort'),
     application_types: all('SELECT * FROM application_types ORDER BY sort'),
+    employment_statuses: all('SELECT * FROM employment_statuses ORDER BY sort'),
     document_types: all('SELECT * FROM document_types ORDER BY sort'),
     permissions: ALL_PERMISSIONS,
     staff_roles: STAFF_ROLES,
+    integrations: {
+      email_transport: process.env.EMAIL_TRANSPORT || 'log',
+      microsoft_graph: require('../msgraph').isConfigured(),
+      onedrive: require('../onedrive').isEnabled(),
+      ai_review: require('../ai-review').isEnabled(),
+    },
   }));
+
+  // ------------------------------ Employment statuses ------------------------------
+  router.post('/api/settings/employment-statuses', manage, (ctx) => {
+    const name = str(ctx.body && ctx.body.name, 100);
+    if (!name) throw new ApiError(400, 'The employment status needs a name.', 'missing_field');
+    const maxSort = get('SELECT MAX(sort) AS m FROM employment_statuses');
+    const key = str(ctx.body.key, 50) || `custom_${Date.now()}`;
+    if (get('SELECT id FROM employment_statuses WHERE key = ?', key)) {
+      throw new ApiError(400, 'An employment status with that key already exists.', 'duplicate');
+    }
+    const res = run(
+      'INSERT INTO employment_statuses (key, name, sort) VALUES (?, ?, ?)',
+      key, name, ((maxSort && maxSort.m) || 0) + 10
+    );
+    audit(ctx.user.id, 'employment_status_created', 'employment_status', Number(res.lastInsertRowid), ctx.ip);
+    return { ok: true, id: Number(res.lastInsertRowid) };
+  });
+
+  router.patch('/api/settings/employment-statuses/:id', manage, (ctx) => {
+    const row = get('SELECT * FROM employment_statuses WHERE id = ?', Number(ctx.params.id));
+    if (!row) throw new ApiError(404, 'Employment status not found.', 'not_found');
+    const b = ctx.body || {};
+    run(
+      'UPDATE employment_statuses SET name = ?, active = ? WHERE id = ?',
+      b.name !== undefined ? str(b.name, 100) || row.name : row.name,
+      b.active !== undefined ? bool(b.active) : row.active,
+      row.id
+    );
+    audit(ctx.user.id, 'employment_status_updated', 'employment_status', row.id, ctx.ip);
+    return { ok: true };
+  });
+
+  router.post('/api/settings/employment-statuses/reorder', manage, (ctx) => {
+    const ids = Array.isArray(ctx.body && ctx.body.ids) ? ctx.body.ids : [];
+    ids.forEach((id, i) => run('UPDATE employment_statuses SET sort = ? WHERE id = ?', (i + 1) * 10, Number(id)));
+    return { ok: true };
+  });
+
+  router.post('/api/settings/application-types/reorder', manage, (ctx) => {
+    const ids = Array.isArray(ctx.body && ctx.body.ids) ? ctx.body.ids : [];
+    ids.forEach((id, i) => run('UPDATE application_types SET sort = ? WHERE id = ?', (i + 1) * 10, Number(id)));
+    return { ok: true };
+  });
 
   // ------------------------------ Config blobs ------------------------------
   router.get('/api/settings/config/:key', manage, (ctx) => {
@@ -119,17 +170,24 @@ function register(router) {
   });
 
   // ------------------------------ Document types ------------------------------
+  const DOC_CATEGORIES = ['identity', 'credit', 'income', 'property', 'financial', 'corporate', 'other'];
+
   router.post('/api/settings/document-types', manage, (ctx) => {
     const b = ctx.body || {};
     const name = str(b.name, 150);
     if (!name) throw new ApiError(400, 'The document type needs a name.', 'missing_field');
     const maxSort = get('SELECT MAX(sort) AS m FROM document_types');
     const res = run(
-      'INSERT INTO document_types (key, name, category, description, sort) VALUES (?, ?, ?, ?, ?)',
+      `INSERT INTO document_types
+         (key, name, category, description, sort, default_requirement, default_per_applicant, default_expires_days)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       `custom_${Date.now()}`, name,
-      ['identity', 'income', 'property', 'financial', 'other'].includes(b.category) ? b.category : 'other',
-      str(b.description, 500), ((maxSort && maxSort.m) || 0) + 10
+      DOC_CATEGORIES.includes(b.category) ? b.category : 'other',
+      str(b.description, 1000), ((maxSort && maxSort.m) || 0) + 10,
+      b.default_requirement === 'optional' ? 'optional' : 'required',
+      bool(b.default_per_applicant), intOrNull(b.default_expires_days)
     );
+    audit(ctx.user.id, 'document_type_created', 'document_type', Number(res.lastInsertRowid), ctx.ip);
     return { ok: true, id: Number(res.lastInsertRowid) };
   });
 
@@ -138,14 +196,31 @@ function register(router) {
     if (!type) throw new ApiError(404, 'Document type not found.', 'not_found');
     const b = ctx.body || {};
     run(
-      'UPDATE document_types SET name = ?, category = ?, description = ?, active = ? WHERE id = ?',
+      `UPDATE document_types SET name = ?, category = ?, description = ?, active = ?,
+         default_requirement = ?, default_per_applicant = ?, default_expires_days = ? WHERE id = ?`,
       b.name !== undefined ? str(b.name, 150) || type.name : type.name,
-      b.category !== undefined && ['identity', 'income', 'property', 'financial', 'other'].includes(b.category) ? b.category : type.category,
-      b.description !== undefined ? str(b.description, 500) : type.description,
+      b.category !== undefined && DOC_CATEGORIES.includes(b.category) ? b.category : type.category,
+      b.description !== undefined ? str(b.description, 1000) : type.description,
       b.active !== undefined ? bool(b.active) : type.active,
+      b.default_requirement === 'optional' ? 'optional' : b.default_requirement === 'required' ? 'required' : type.default_requirement,
+      b.default_per_applicant !== undefined ? bool(b.default_per_applicant) : type.default_per_applicant,
+      b.default_expires_days !== undefined ? intOrNull(b.default_expires_days) : type.default_expires_days,
       type.id
     );
+    audit(ctx.user.id, 'document_type_updated', 'document_type', type.id, ctx.ip);
     return { ok: true };
+  });
+
+  /** Catalog search for the "+ Add Document" picker in the Add Client wizard. */
+  router.get('/api/settings/document-types/search', requireStaff, (ctx) => {
+    const q = str(ctx.query.q, 100).toLowerCase();
+    let rows = all('SELECT * FROM document_types WHERE active = 1 ORDER BY sort');
+    if (q) {
+      rows = rows.filter(
+        (r) => r.name.toLowerCase().includes(q) || (r.category || '').toLowerCase().includes(q)
+      );
+    }
+    return { document_types: rows.slice(0, 50) };
   });
 
   // ------------------------------ Document rules ------------------------------
@@ -250,6 +325,22 @@ function register(router) {
   router.post('/api/settings/templates/preview', requireStaff, (ctx) => {
     const b = ctx.body || {};
     return { preview: previewTemplate(String(b.subject || ''), String(b.body || '')) };
+  });
+
+  /** Restore a template to the wording this platform ships with. */
+  router.post('/api/settings/templates/:key/reset', manage, (ctx) => {
+    const key = str(ctx.params.key, 50);
+    const template = get('SELECT * FROM email_templates WHERE key = ?', key);
+    if (!template) throw new ApiError(404, 'Template not found.', 'not_found');
+    const { DEFAULT_EMAIL_TEMPLATES } = require('../seed');
+    const original = DEFAULT_EMAIL_TEMPLATES.find((t) => t.key === key);
+    if (!original) throw new ApiError(400, 'This template has no shipped default to restore.', 'no_default');
+    run(
+      'UPDATE email_templates SET subject = ?, body = ?, updated_at = ?, updated_by = ? WHERE key = ?',
+      original.subject, original.body, now(), ctx.user.id, key
+    );
+    audit(ctx.user.id, 'template_reset', 'email_template', null, ctx.ip, { key });
+    return { ok: true, template: get('SELECT * FROM email_templates WHERE key = ?', key) };
   });
 
   // ------------------------------ Consent forms ------------------------------

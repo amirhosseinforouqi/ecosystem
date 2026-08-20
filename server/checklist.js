@@ -3,21 +3,6 @@
 /**
  * Document requirement engine.
  *
- * Brokerage-configured rules (document_rules + document_rule_items) are
- * evaluated against a file and its applicants to produce the document
- * checklist automatically. Rules are combinable: Purchase + Employee + FTHB
- * yields the union of every matching rule's items.
- *
- * Conditions (all present conditions must match — AND across conditions):
- *   application_type_keys: ['purchase', ...]   any-of match on the file's type
- *   fthb: true                                  file is a first-time home buyer file
- *   employment_types: ['employee', ...]         applicant-level; items are created
- *                                               per matching applicant
- *
- * Sync semantics: re-running the engine only ADDS missing items. It never
- * touches broker-created (manual) requests, and it only removes a rule item
- * that no longer applies when nothing was ever uploaded against it.
- *
  * Three layers, kept strictly separate:
  *   1. Document catalog  — document_types, the master list of document kinds
  *   2. Document rules    — document_rules/_items, the global service +
@@ -49,15 +34,10 @@ function applicantMatches(conditions, applicant) {
   return true;
 }
 
-/**
- * Evaluate the global rules for an arbitrary service + applicant set.
- * Shared by desiredChecklist (a saved file) and previewChecklist (the Add
- * Client wizard, which needs the defaults before any file exists).
- */
-function evaluateRules({ file, typeKey, applicants }) {
-  const rules = all('SELECT * FROM document_rules WHERE active = 1');
+/** Evaluate the global rules for an arbitrary service + applicant set. */
+async function evaluateRules({ file, typeKey, applicants }) {
+  const rules = await all('SELECT * FROM document_rules WHERE active = 1');
 
-  // Key: docTypeId:applicantId — dedupe across rules, "required" wins over "optional".
   const desired = new Map();
   const upsert = (docTypeId, applicantId, requirement, expiresDays, ruleId) => {
     const key = `${docTypeId}:${applicantId ?? 'file'}`;
@@ -76,7 +56,7 @@ function evaluateRules({ file, typeKey, applicants }) {
   for (const rule of rules) {
     const conditions = parseJsonSafe(rule.conditions, {});
     if (!ruleMatchesFile(conditions, file, typeKey)) continue;
-    const items = all('SELECT * FROM document_rule_items WHERE rule_id = ?', rule.id);
+    const items = await all('SELECT * FROM document_rule_items WHERE rule_id = ?', rule.id);
     const hasApplicantCondition = Array.isArray(conditions.employment_types) && conditions.employment_types.length > 0;
 
     for (const item of items) {
@@ -93,107 +73,89 @@ function evaluateRules({ file, typeKey, applicants }) {
   return [...desired.values()];
 }
 
-/**
- * Compute the desired rule-driven checklist for a saved file.
- * Returns entries: { document_type_id, applicant_id|null, requirement, expires_days, rule_id }
- */
-function desiredChecklist(fileId) {
-  const file = get('SELECT * FROM client_files WHERE id = ?', fileId);
+/** Compute the desired rule-driven checklist for a saved file. */
+async function desiredChecklist(fileId) {
+  const file = await get('SELECT * FROM client_files WHERE id = ?', fileId);
   if (!file) return [];
   const type = file.application_type_id
-    ? get('SELECT * FROM application_types WHERE id = ?', file.application_type_id)
+    ? await get('SELECT * FROM application_types WHERE id = ?', file.application_type_id)
     : null;
-  const applicants = all('SELECT * FROM applicants WHERE file_id = ? ORDER BY id', fileId);
+  const applicants = await all('SELECT * FROM applicants WHERE file_id = ? ORDER BY id', fileId);
   return evaluateRules({ file, typeKey: type ? type.key : null, applicants });
 }
 
 /**
  * Rule defaults for a prospective client — the Add Client wizard calls this
- * after Step 1 (service) and Step 2 (employment status), before any client
- * record exists. Purely read-only: it never writes rules or checklists.
- *
- * Returns catalog-enriched rows the broker can then add to / remove from
- * for this one client without touching the global rules.
+ * after the service and employment steps, before any client record exists.
+ * Purely read-only: it never writes rules or checklists.
  */
-function previewChecklist(applicationTypeId, employmentType, { fthb = false } = {}) {
+async function previewChecklist(applicationTypeId, employmentType, { fthb = false } = {}) {
   const type = applicationTypeId
-    ? get('SELECT * FROM application_types WHERE id = ?', Number(applicationTypeId))
+    ? await get('SELECT * FROM application_types WHERE id = ?', Number(applicationTypeId))
     : null;
-  // A single synthetic applicant stands in for the primary client so
-  // per-applicant rules resolve; ids are negative so they can never collide
-  // with real applicant ids.
   const pseudoApplicant = { id: -1, employment_type: String(employmentType || '') };
-  const entries = evaluateRules({
+  const entries = await evaluateRules({
     file: { fthb: fthb ? 1 : 0 },
     typeKey: type ? type.key : null,
     applicants: [pseudoApplicant],
   });
-  return entries
-    .map((e) => {
-      const docType = get('SELECT * FROM document_types WHERE id = ? AND active = 1', e.document_type_id);
-      if (!docType) return null;
-      return {
-        document_type_id: docType.id,
-        document_name: docType.name,
-        category: docType.category,
-        instructions: docType.description,
-        requirement: e.requirement,
-        per_applicant: e.applicant_id !== null,
-        expires_days: e.expires_days,
-      };
-    })
-    .filter(Boolean);
+  const out = [];
+  for (const e of entries) {
+    const docType = await get('SELECT * FROM document_types WHERE id = ? AND active = 1', e.document_type_id);
+    if (!docType) continue;
+    out.push({
+      document_type_id: docType.id,
+      document_name: docType.name,
+      category: docType.category,
+      instructions: docType.description,
+      requirement: e.requirement,
+      per_applicant: e.applicant_id !== null,
+      expires_days: e.expires_days,
+    });
+  }
+  return out;
 }
 
-function isExcluded(fileId, documentTypeId, applicantId) {
-  return !!get(
+async function isExcluded(fileId, documentTypeId, applicantId) {
+  const row = await get(
     `SELECT id FROM checklist_exclusions
       WHERE file_id = ? AND document_type_id = ?
-        AND ((applicant_id IS NULL AND ? IS NULL) OR applicant_id = ?)`,
-    fileId, documentTypeId, applicantId ?? null, applicantId ?? null
+        AND COALESCE(applicant_id, -1) = COALESCE(?::int, -1)`,
+    fileId, documentTypeId, applicantId ?? null
   );
+  return !!row;
 }
 
 /** Record a client-specific removal so rule re-sync will not re-add it. */
-function excludeFromChecklist(fileId, documentTypeId, applicantId, actorId = null) {
-  run(
+async function excludeFromChecklist(fileId, documentTypeId, applicantId, actorId = null) {
+  await run(
     `INSERT INTO checklist_exclusions (file_id, document_type_id, applicant_id, excluded_by, created_at)
      VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT (file_id, document_type_id, applicant_id) DO NOTHING`,
+     ON CONFLICT (file_id, document_type_id, COALESCE(applicant_id, -1)) DO NOTHING`,
     fileId, documentTypeId, applicantId ?? null, actorId, now()
   );
 }
 
 /**
- * Undo a client-specific removal (the next sync restores the item).
- * Pass an applicantId to restore just that applicant's copy; omit it
- * (undefined) to restore the document for the whole file — which is what
- * "restore this document" means to a broker, since a per-applicant rule
- * records one exclusion per applicant.
+ * Undo a client-specific removal. Pass an applicantId to restore just that
+ * applicant's copy; omit it (undefined) to restore for the whole file.
  */
-function unexcludeFromChecklist(fileId, documentTypeId, applicantId) {
+async function unexcludeFromChecklist(fileId, documentTypeId, applicantId) {
   if (applicantId === undefined) {
-    run(
-      'DELETE FROM checklist_exclusions WHERE file_id = ? AND document_type_id = ?',
-      fileId, documentTypeId
-    );
+    await run('DELETE FROM checklist_exclusions WHERE file_id = ? AND document_type_id = ?', fileId, documentTypeId);
     return;
   }
-  run(
+  await run(
     `DELETE FROM checklist_exclusions
-      WHERE file_id = ? AND document_type_id = ?
-        AND ((applicant_id IS NULL AND ? IS NULL) OR applicant_id = ?)`,
-    fileId, documentTypeId, applicantId ?? null, applicantId ?? null
+      WHERE file_id = ? AND document_type_id = ? AND COALESCE(applicant_id, -1) = COALESCE(?::int, -1)`,
+    fileId, documentTypeId, applicantId ?? null
   );
 }
 
-/**
- * Bring the file's stored checklist in line with the rules.
- * Returns { added, removed } counts.
- */
-function syncChecklist(fileId, actorId = null) {
-  const desired = desiredChecklist(fileId);
-  const existing = all('SELECT * FROM document_requests WHERE file_id = ?', fileId);
+/** Bring the file's stored checklist in line with the rules. */
+async function syncChecklist(fileId, actorId = null) {
+  const desired = await desiredChecklist(fileId);
+  const existing = await all('SELECT * FROM document_requests WHERE file_id = ?', fileId);
   const desiredKeys = new Set(desired.map((d) => `${d.document_type_id}:${d.applicant_id ?? 'file'}`));
 
   let added = 0;
@@ -201,65 +163,57 @@ function syncChecklist(fileId, actorId = null) {
 
   for (const want of desired) {
     const match = existing.find(
-      (r) =>
-        r.document_type_id === want.document_type_id &&
-        (r.applicant_id ?? null) === (want.applicant_id ?? null)
+      (r) => r.document_type_id === want.document_type_id &&
+             (r.applicant_id ?? null) === (want.applicant_id ?? null)
     );
     if (match) continue;
-    // The broker removed this item for this client specifically — honour
-    // that instead of re-adding it from the global rule.
-    if (isExcluded(fileId, want.document_type_id, want.applicant_id ?? null)) continue;
-    run(
+    if (await isExcluded(fileId, want.document_type_id, want.applicant_id ?? null)) continue;
+    await run(
       `INSERT INTO document_requests
          (file_id, applicant_id, document_type_id, status, requirement, source, rule_id, expires_days, created_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 'rule', ?, ?, ?, ?, ?)`,
-      fileId,
-      want.applicant_id,
-      want.document_type_id,
-      'required',
-      want.requirement,
-      want.rule_id,
-      want.expires_days,
-      actorId,
-      now(),
-      now()
+      fileId, want.applicant_id, want.document_type_id, 'required',
+      want.requirement, want.rule_id, want.expires_days, actorId, now(), now()
     );
     added += 1;
   }
 
-  // Remove rule items that no longer apply, but only if nothing was uploaded.
   for (const req of existing) {
     if (req.source !== 'rule') continue;
     const key = `${req.document_type_id}:${req.applicant_id ?? 'file'}`;
     if (desiredKeys.has(key)) continue;
-    const hasUploads = get('SELECT id FROM document_versions WHERE request_id = ? LIMIT 1', req.id);
+    const hasUploads = await get('SELECT id FROM document_versions WHERE request_id = ? LIMIT 1', req.id);
     if (hasUploads) continue;
-    run('DELETE FROM document_requests WHERE id = ?', req.id);
+    await run('DELETE FROM document_requests WHERE id = ?', req.id);
     removed += 1;
   }
 
   return { added, removed };
 }
 
-/** True when every required (non-waived) item on the file is approved or uploaded. */
-function checklistProgress(fileId) {
-  const rows = all(
-    `SELECT status, requirement FROM document_requests WHERE file_id = ? AND status != 'waived'`,
+/** Aggregate checklist state for a file, in a single query. */
+async function checklistProgress(fileId) {
+  const row = await get(
+    `SELECT
+       COUNT(*) FILTER (WHERE requirement = 'required')::int AS total_required,
+       COUNT(*) FILTER (WHERE requirement = 'required'
+                          AND status IN ('required','rejected','replacement_requested','expired'))::int AS outstanding,
+       COUNT(*) FILTER (WHERE requirement = 'required' AND status = 'approved')::int AS approved,
+       COUNT(*) FILTER (WHERE status IN ('uploaded','under_review'))::int AS awaiting_review
+     FROM document_requests
+     WHERE file_id = ? AND status <> 'waived'`,
     fileId
   );
-  const required = rows.filter((r) => r.requirement === 'required');
-  const outstanding = required.filter((r) =>
-    ['required', 'rejected', 'replacement_requested', 'expired'].includes(r.status)
-  );
-  const approved = required.filter((r) => r.status === 'approved');
-  const awaitingReview = rows.filter((r) => ['uploaded', 'under_review'].includes(r.status));
+  const totalRequired = row ? row.total_required : 0;
+  const outstanding = row ? row.outstanding : 0;
+  const approved = row ? row.approved : 0;
   return {
-    total_required: required.length,
-    outstanding: outstanding.length,
-    approved: approved.length,
-    awaiting_review: awaitingReview.length,
-    all_submitted: required.length > 0 && outstanding.length === 0,
-    complete: required.length > 0 && approved.length === required.length,
+    total_required: totalRequired,
+    outstanding,
+    approved,
+    awaiting_review: row ? row.awaiting_review : 0,
+    all_submitted: totalRequired > 0 && outstanding === 0,
+    complete: totalRequired > 0 && approved === totalRequired,
   };
 }
 

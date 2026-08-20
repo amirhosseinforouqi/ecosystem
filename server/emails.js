@@ -7,25 +7,19 @@ const smtp = require('./smtp');
 /**
  * Email delivery is an outbox: every email is rendered from a template and
  * recorded in email_log first (the portal is the source of truth; email is a
- * notification layer). Delivery happens through a pluggable transport so a
- * real provider can be wired in without touching any calling code.
+ * notification layer). Delivery happens through a pluggable transport.
  */
 
 const transports = {
-  /** Default transport: marks the email as sent and logs it locally. */
   log: async (email) => {
     if (process.env.NODE_ENV !== 'test') {
-      console.log(`[email] to=${email.to_email} subject="${email.subject}"`);
+      // Recipient addresses are PII — log the template and the log-row id,
+      // never the address itself (audit finding M9).
+      console.log(`[email] template=${email.template_key || 'n/a'} log_id=${email.log_id}`);
     }
     return { ok: true };
   },
-  /** No-op transport: emails stay recorded but are never delivered. */
   disabled: async () => ({ ok: true, skipped: true }),
-  /**
-   * Sends through a real mailbox via SMTP (Gmail, Outlook/Microsoft 365, or
-   * any SMTP-AUTH provider). Configured entirely by environment variables —
-   * see README "Connect a real email account".
-   */
   smtp: async (email) => {
     const host = process.env.SMTP_HOST;
     const user = process.env.SMTP_USER;
@@ -49,10 +43,9 @@ const transports = {
     return { ok: true };
   },
   /**
-   * Sends through a connected Microsoft 365 / Outlook mailbox via the
-   * Microsoft Graph API (OAuth client credentials — the mailbox password is
-   * never entered into or stored by this application). Configured via
-   * MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET / MS_MAILBOX.
+   * Microsoft 365 / Outlook via Microsoft Graph, using OAuth client
+   * credentials — the mailbox password is never entered into or stored by
+   * this application.
    */
   graph: async (email) => {
     const msgraph = require('./msgraph');
@@ -69,9 +62,12 @@ const transports = {
   },
 };
 
+function transportName() {
+  return process.env.EMAIL_TRANSPORT || 'log';
+}
+
 function activeTransport() {
-  const name = process.env.EMAIL_TRANSPORT || 'log';
-  return transports[name] || transports.log;
+  return transports[transportName()] || transports.log;
 }
 
 function renderTemplate(text, vars) {
@@ -81,8 +77,8 @@ function renderTemplate(text, vars) {
   });
 }
 
-function baseVars(extra = {}) {
-  const brokerage = getSetting('brokerage', {});
+async function baseVars(extra = {}) {
+  const brokerage = await getSetting('brokerage', {});
   return {
     brokerage_name: brokerage.name || 'Your Brokerage',
     broker_name: brokerage.broker_name || 'Your Broker',
@@ -97,19 +93,18 @@ function portalBaseUrl() {
 
 /**
  * Render a template and queue+send it. Returns the email_log row id.
- * vars can include: client_first_name, client_last_name, application_stage,
- * document_name, closing_date, portal_link, username, application_number...
  *
  * `redact` lists secret values (e.g. a temporary password): they are sent in
- * the real email but replaced with a mask in the stored email_log copy, so
- * secrets are never persisted in plaintext.
+ * the real email but replaced with a mask in the stored copy, so secrets are
+ * never persisted in plaintext.
  */
 async function sendTemplate(templateKey, { toEmail, toName, userId, fileId, vars = {}, redact = [] }) {
-  const template = get('SELECT * FROM email_templates WHERE key = ?', templateKey);
+  const template = await get('SELECT * FROM email_templates WHERE key = ?', templateKey);
   if (!template) return null;
-  const merged = baseVars(vars);
+  const merged = await baseVars(vars);
   const subject = renderTemplate(template.subject, merged);
   const body = renderTemplate(template.body, merged);
+
   let storedSubject = subject;
   let storedBody = body;
   for (const secret of redact) {
@@ -117,36 +112,43 @@ async function sendTemplate(templateKey, { toEmail, toName, userId, fileId, vars
     storedSubject = storedSubject.split(secret).join('••••••••');
     storedBody = storedBody.split(secret).join('••••••••');
   }
-  const res = run(
+
+  const row = await get(
     `INSERT INTO email_log (to_email, to_name, user_id, file_id, template_key, subject, body, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?) RETURNING id`,
     toEmail, toName || '', userId ?? null, fileId ?? null, templateKey, storedSubject, storedBody, now()
   );
-  const id = Number(res.lastInsertRowid);
+  const id = row.id;
 
   if (!template.active) {
-    run("UPDATE email_log SET status = 'disabled' WHERE id = ?", id);
+    await run("UPDATE email_log SET status = 'disabled' WHERE id = ?", id);
     return id;
   }
   try {
-    await activeTransport()({ to_email: toEmail, to_name: toName, subject, body });
-    run("UPDATE email_log SET status = 'sent', sent_at = ? WHERE id = ?", now(), id);
+    await activeTransport()({
+      to_email: toEmail, to_name: toName, subject, body,
+      template_key: templateKey, log_id: id,
+    });
+    await run("UPDATE email_log SET status = 'sent', sent_at = ? WHERE id = ?", now(), id);
   } catch (err) {
-    run("UPDATE email_log SET status = 'failed', error = ? WHERE id = ?", String(err.message || err).slice(0, 500), id);
+    await run(
+      "UPDATE email_log SET status = 'failed', error = ? WHERE id = ?",
+      String(err.message || err).slice(0, 500), id
+    );
   }
   return id;
 }
 
 /** Render a template with sample data for previewing in settings. */
-function previewTemplate(subject, body) {
-  const sample = baseVars({
+async function previewTemplate(subject, body) {
+  const sample = await baseVars({
     client_first_name: 'John',
     client_last_name: 'Smith',
     application_stage: 'Documents Requested',
     document_name: 'Recent Pay Stub',
     closing_date: '2026-10-15',
     username: 'john.smith@example.com',
-    temporary_password: 'Xk4-mQ9t-Bw2p',
+    temporary_password: 'Xk4m-Qw9t-Bw2p',
     application_number: 'MTG-2026-00128',
     service_type: 'Purchase',
     document_list: '- Most recent pay stub\n- Employment letter\n- 2025 Notice of Assessment',
@@ -159,4 +161,4 @@ function previewTemplate(subject, body) {
   };
 }
 
-module.exports = { sendTemplate, previewTemplate, renderTemplate, portalBaseUrl };
+module.exports = { sendTemplate, previewTemplate, renderTemplate, portalBaseUrl, transportName };

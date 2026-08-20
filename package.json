@@ -5,14 +5,23 @@
   "description": "A simple, secure mortgage client management platform: broker portal + client portal, document collection, chat, stages, tasks and reminders.",
   "type": "commonjs",
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22"
   },
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server/index.js",
-    "dev": "node --watch --disable-warning=ExperimentalWarning server/index.js",
-    "seed:demo": "node --disable-warning=ExperimentalWarning scripts/seed-demo.js",
-    "reset:broker-only": "node --disable-warning=ExperimentalWarning scripts/reset-broker-only.js",
-    "test:email": "node --disable-warning=ExperimentalWarning scripts/send-test-email.js",
-    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.js"
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "migrate": "node scripts/migrate.js",
+    "keygen": "node scripts/keygen.js",
+    "backup": "node scripts/backup.js",
+    "restore": "node scripts/restore.js",
+    "jobs": "node scripts/run-jobs.js",
+    "seed:demo": "node scripts/seed-demo.js",
+    "reset:broker-only": "node scripts/reset-broker-only.js",
+    "test:email": "node scripts/send-test-email.js",
+    "verify:build": "node scripts/verify-build.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
   }
 }

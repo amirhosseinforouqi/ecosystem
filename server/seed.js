@@ -9,11 +9,11 @@ const ALL_PERMISSIONS = [
   'clients.create',
   'clients.edit',
   'clients.archive',
-  'documents.view',
+  'documents.view',        // see the checklist and document metadata
+  'documents.download',    // retrieve the actual file bytes (preview OR download)
   'documents.upload',
   'documents.review',
   'documents.request',
-  'documents.download',
   'stage.change',
   'chat.send',
   'tasks.manage',
@@ -88,9 +88,25 @@ const DEFAULT_SETTINGS = {
     allowed_ext: ['pdf', 'jpg', 'jpeg', 'png', 'heic', 'heif', 'webp'],
   },
   security: {
-    session_days: 7,
-    lockout_threshold: 5,
+    // Idle windows; the absolute lifetime below is never extended by activity.
+    session_days_staff: 1,
+    session_days_client: 7,
+    session_absolute_hours_staff: 12,
+    session_absolute_hours_client: 336,
+    // Lockout is a last resort — rate limiting does the primary work, so the
+    // threshold is high enough that it is not a practical way to lock a
+    // broker out of their own account (audit finding H8).
+    lockout_threshold: 8,
     lockout_minutes: 15,
+    min_password_length_staff: 12,
+    min_password_length_client: 10,
+    mfa_required_roles: ['admin', 'manager', 'broker', 'processor'],
+  },
+  ai_review: {
+    // Off until the brokerage turns it on AND the server is configured with a
+    // processing agreement reference (audit finding C6).
+    enabled: false,
+    require_client_consent: true,
   },
   retention: {
     policy_note:
@@ -399,6 +415,22 @@ Thank you!
 {{brokerage_name}}`,
   },
   {
+    key: 'staff_invite',
+    name: 'Staff invitation',
+    subject: 'Your {{brokerage_name}} account',
+    body: `Hi {{client_first_name}},
+
+An administrator has created a brokerage account for you at {{brokerage_name}}.
+
+Use the link below to set your own password and finish setting up your account. The link works once and expires in 7 days.
+
+{{portal_link}}
+
+No password was set for you, so this link is the only way in. If you were not expecting this email, tell your administrator — do not use the link.
+
+— {{brokerage_name}} platform`,
+  },
+  {
     key: 'staff_notification',
     name: 'Staff notification (internal)',
     subject: '{{notification_title}}',
@@ -413,59 +445,59 @@ Open the broker portal for details:
   },
 ];
 
-function seedIfNeeded() {
+async function seedIfNeeded() {
   // Settings
   for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-    if (getSetting(key, undefined) === undefined) setSetting(key, value);
+    if ((await getSetting(key, undefined)) === undefined) await setSetting(key, value);
   }
 
   // Stages
-  if (!get('SELECT id FROM stages LIMIT 1')) {
-    STAGES.forEach(([key, name, clientLabel, clientMessage, step, color, sendEmail, isTerminal], i) => {
-      run(
+  if (!(await get('SELECT id FROM stages LIMIT 1'))) {
+    for (const [i, [key, name, clientLabel, clientMessage, step, color, sendEmail, isTerminal]] of STAGES.entries()) {
+      await run(
         `INSERT INTO stages (key, name, client_label, client_message, client_step, color, sort, send_email, email_template_key, is_terminal)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         key, name, clientLabel, clientMessage, step, color, (i + 1) * 10, sendEmail, sendEmail ? 'stage_changed' : null, isTerminal
       );
-    });
+    }
   }
 
   // Application types (services)
-  if (!get('SELECT id FROM application_types LIMIT 1')) {
-    APPLICATION_TYPES.forEach(([key, name], i) => {
-      run('INSERT INTO application_types (key, name, sort) VALUES (?, ?, ?)', key, name, (i + 1) * 10);
-    });
+  if (!(await get('SELECT id FROM application_types LIMIT 1'))) {
+    for (const [i, [key, name]] of APPLICATION_TYPES.entries()) {
+      await run('INSERT INTO application_types (key, name, sort) VALUES (?, ?, ?)', key, name, (i + 1) * 10);
+    }
   }
 
   // Employment statuses (configurable; seeded once, then admin-managed)
-  if (!get('SELECT id FROM employment_statuses LIMIT 1')) {
-    EMPLOYMENT_STATUSES.forEach(([key, name], i) => {
-      run('INSERT INTO employment_statuses (key, name, sort) VALUES (?, ?, ?)', key, name, (i + 1) * 10);
-    });
+  if (!(await get('SELECT id FROM employment_statuses LIMIT 1'))) {
+    for (const [i, [key, name]] of EMPLOYMENT_STATUSES.entries()) {
+      await run('INSERT INTO employment_statuses (key, name, sort) VALUES (?, ?, ?)', key, name, (i + 1) * 10);
+    }
   }
 
   // Document types
-  if (!get('SELECT id FROM document_types LIMIT 1')) {
-    DOCUMENT_TYPES.forEach(([key, name, category, description], i) => {
-      run(
+  if (!(await get('SELECT id FROM document_types LIMIT 1'))) {
+    for (const [i, [key, name, category, description]] of DOCUMENT_TYPES.entries()) {
+      await run(
         'INSERT INTO document_types (key, name, category, description, sort) VALUES (?, ?, ?, ?, ?)',
         key, name, category, description, (i + 1) * 10
       );
-    });
+    }
   }
 
   // Document rules
-  if (!get('SELECT id FROM document_rules LIMIT 1')) {
+  if (!(await get('SELECT id FROM document_rules LIMIT 1'))) {
     for (const rule of DOCUMENT_RULES) {
-      const res = run(
-        'INSERT INTO document_rules (name, active, conditions, created_at, updated_at) VALUES (?, 1, ?, ?, ?)',
+      const ruleRow = await get(
+        'INSERT INTO document_rules (name, active, conditions, created_at, updated_at) VALUES (?, 1, ?, ?, ?) RETURNING id',
         rule.name, JSON.stringify(rule.conditions), now(), now()
       );
-      const ruleId = Number(res.lastInsertRowid);
+      const ruleId = ruleRow.id;
       for (const [docKey, requirement, perApplicant, expiresDays] of rule.items) {
-        const doc = get('SELECT id FROM document_types WHERE key = ?', docKey);
+        const doc = await get('SELECT id FROM document_types WHERE key = ?', docKey);
         if (!doc) continue;
-        run(
+        await run(
           'INSERT INTO document_rule_items (rule_id, document_type_id, requirement, per_applicant, expires_days) VALUES (?, ?, ?, ?, ?)',
           ruleId, doc.id, requirement, perApplicant, expiresDays
         );
@@ -475,34 +507,71 @@ function seedIfNeeded() {
 
   // Email templates
   for (const t of EMAIL_TEMPLATES) {
-    if (!get('SELECT key FROM email_templates WHERE key = ?', t.key)) {
-      run(
+    if (!(await get('SELECT key FROM email_templates WHERE key = ?', t.key))) {
+      await run(
         'INSERT INTO email_templates (key, name, subject, body, active) VALUES (?, ?, ?, ?, 1)',
         t.key, t.name, t.subject, t.body
       );
     }
   }
 
-  // Initial admin account. Password must be set on first boot via env or defaults
-  // to a generated one printed to the console (never stored in plaintext).
-  if (!get("SELECT id FROM users WHERE role != 'client' LIMIT 1")) {
-    const { hashPassword } = require('./auth');
-    const email = process.env.ADMIN_EMAIL || 'admin@example.com';
-    const password = process.env.ADMIN_PASSWORD || require('node:crypto').randomBytes(9).toString('base64url');
-    run(
-      `INSERT INTO users (role, email, first_name, last_name, password_hash, status, created_at, updated_at)
-       VALUES ('admin', ?, 'Admin', 'User', ?, 'active', ?, ?)`,
-      email, hashPassword(password), now(), now()
-    );
-    if (!process.env.ADMIN_PASSWORD) {
-      console.log('--------------------------------------------------------------');
-      console.log('  First run: created admin account');
-      console.log(`  Email:    ${email}`);
-      console.log(`  Password: ${password}`);
-      console.log('  Change this password after logging in.');
-      console.log('--------------------------------------------------------------');
-    }
-  }
+  await bootstrapAdmin();
 }
 
-module.exports = { seedIfNeeded, ALL_PERMISSIONS, DEFAULT_ROLE_PERMISSIONS, DEFAULT_EMAIL_TEMPLATES: EMAIL_TEMPLATES };
+/**
+ * Create the first administrator (audit finding C4).
+ *
+ * There is deliberately no default password. ADMIN_PASSWORD, when supplied,
+ * must satisfy the staff password policy; otherwise a strong random one is
+ * generated and printed once. Either way the account is flagged
+ * must_change_password, so the bootstrap credential cannot become a standing
+ * one, and MFA enrolment is then required on first sign-in.
+ */
+async function bootstrapAdmin() {
+  if (await get("SELECT id FROM users WHERE role <> 'client' LIMIT 1")) return null;
+
+  const { hashPassword, validatePasswordStrength } = require('./auth');
+  const email = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  if (!email) {
+    throw new Error(
+      'No administrator exists and ADMIN_EMAIL is not set. Set ADMIN_EMAIL (and optionally ' +
+      'ADMIN_PASSWORD) to create the first administrator — there is no default account.'
+    );
+  }
+
+  let password = process.env.ADMIN_PASSWORD;
+  let generated = false;
+  if (password) {
+    // A supplied bootstrap password is held to the same policy as any other
+    // staff password — no weak value can enter the system this way.
+    await validatePasswordStrength(password, { role: 'admin', user: { email } });
+  } else {
+    password = require('node:crypto').randomBytes(24).toString('base64url');
+    generated = true;
+  }
+
+  await run(
+    `INSERT INTO users (role, email, first_name, last_name, password_hash, status, must_change_password, created_at, updated_at)
+     VALUES ('admin', ?, 'Admin', 'User', ?, 'active', 1, ?, ?)`,
+    email, await hashPassword(password), now(), now()
+  );
+
+  if (generated) {
+    console.log('--------------------------------------------------------------');
+    console.log('  Created the first administrator account.');
+    console.log(`  Email:    ${email}`);
+    console.log(`  Password: ${password}`);
+    console.log('  This is shown once. You must change it at first sign-in,');
+    console.log('  and then enrol in two-step verification.');
+    console.log('--------------------------------------------------------------');
+  }
+  return { email, generated };
+}
+
+module.exports = {
+  seedIfNeeded,
+  bootstrapAdmin,
+  ALL_PERMISSIONS,
+  DEFAULT_ROLE_PERMISSIONS,
+  DEFAULT_EMAIL_TEMPLATES: EMAIL_TEMPLATES,
+};

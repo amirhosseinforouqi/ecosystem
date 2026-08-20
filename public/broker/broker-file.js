@@ -482,9 +482,14 @@ function brokerDocRow(file, r) {
       el('button', { class: 'btn sm secondary', onclick: () => reviewModal(file, r, 'request_replacement') }, 'Request replacement'));
   }
   if (r.current_version) {
-    actions.push(el('button', { class: 'btn sm secondary', onclick: () => previewVersion(r.current_version) }, 'Preview'));
+    // Opening a document inline is the same disclosure as downloading it, so
+    // both need documents.download. The server enforces this; the UI just
+    // avoids offering a button that would be refused (audit finding H6).
     if (can('documents.download')) {
+      actions.push(el('button', { class: 'btn sm secondary', onclick: () => previewVersion(r.current_version) }, 'Preview'));
       actions.push(el('a', { class: 'btn sm secondary', href: `/api/broker/versions/${r.current_version.id}/file?disposition=attachment` }, 'Download'));
+    } else {
+      actions.push(el('span', { class: 'faint' }, 'Received — your role cannot open documents'));
     }
   }
   if (['required', 'rejected', 'replacement_requested', 'expired'].includes(r.status) && can('documents.request')) {

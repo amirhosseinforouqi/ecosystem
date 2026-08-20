@@ -1,6 +1,8 @@
 {
   "name": "Mortgage Client Platform",
-  "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/mortgage-client-platform",
   "forwardPorts": [3000],
   "portsAttributes": {
     "3000": {
@@ -8,7 +10,7 @@
       "onAutoForward": "openPreview"
     }
   },
-  "postCreateCommand": "bash .devcontainer/seed.sh",
+  "postCreateCommand": "bash .devcontainer/setup.sh",
   "postStartCommand": "bash .devcontainer/start.sh",
   "customizations": {
     "vscode": {

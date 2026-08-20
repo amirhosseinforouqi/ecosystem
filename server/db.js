@@ -1,508 +1,243 @@
 'use strict';
 
+/**
+ * PostgreSQL data layer (audit finding C5 — replaces experimental node:sqlite).
+ *
+ * Connects via DATABASE_URL, so it runs unchanged against Supabase, any
+ * managed Postgres, or a local cluster. Two deliberate design choices keep
+ * the migration from SQLite low-risk:
+ *
+ *  1. Call sites keep writing `?` placeholders; toPg() rewrites them to
+ *     $1..$n. The hundreds of existing queries did not have to be re-authored
+ *     (and therefore re-reviewed) by hand.
+ *
+ *  2. tx() binds a dedicated client into AsyncLocalStorage, so ordinary
+ *     run/get/all calls inside a transaction callback automatically join that
+ *     transaction instead of silently taking a separate pooled connection.
+ *
+ * Every function is async. There is no synchronous path and no SQLite
+ * fallback — a half-migrated data layer would be worse than either.
+ */
+
 const fs = require('node:fs');
 const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { Pool } = require('pg');
 const { now, parseJsonSafe } = require('./util');
 
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
-fs.mkdirSync(DATA_DIR, { recursive: true });
+const txStore = new AsyncLocalStorage();
 
-const db = new DatabaseSync(path.join(DATA_DIR, 'platform.db'));
-db.exec('PRAGMA journal_mode = WAL');
-db.exec('PRAGMA foreign_keys = ON');
+// Integers arrive as JS numbers rather than strings; the app treats ids and
+// counts numerically throughout. (NUMERIC/money stays a string by default —
+// handled explicitly below.)
+const pgTypes = require('pg').types;
+pgTypes.setTypeParser(20, (v) => (v === null ? null : Number(v)));   // int8
+pgTypes.setTypeParser(1700, (v) => (v === null ? null : Number(v))); // numeric
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  role TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  first_name TEXT NOT NULL DEFAULT '',
-  last_name TEXT NOT NULL DEFAULT '',
-  phone TEXT NOT NULL DEFAULT '',
-  password_hash TEXT,
-  status TEXT NOT NULL DEFAULT 'invited',
-  failed_attempts INTEGER NOT NULL DEFAULT 0,
-  locked_until TEXT,
-  last_login_at TEXT,
-  welcomed_at TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  token_hash TEXT NOT NULL UNIQUE,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  last_seen_at TEXT,
-  ip TEXT,
-  user_agent TEXT
-);
-
-CREATE TABLE IF NOT EXISTS auth_tokens (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL,
-  token_hash TEXT NOT NULL UNIQUE,
-  expires_at TEXT NOT NULL,
-  used_at TEXT,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS login_attempts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT,
-  ip TEXT,
-  success INTEGER NOT NULL,
-  attempted_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS application_types (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  key TEXT UNIQUE,
-  name TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  sort INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS stages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  key TEXT UNIQUE,
-  name TEXT NOT NULL,
-  client_label TEXT NOT NULL DEFAULT '',
-  client_message TEXT NOT NULL DEFAULT '',
-  client_step INTEGER NOT NULL DEFAULT 1,
-  color TEXT NOT NULL DEFAULT '#4f6ef7',
-  icon TEXT NOT NULL DEFAULT '',
-  sort INTEGER NOT NULL DEFAULT 0,
-  active INTEGER NOT NULL DEFAULT 1,
-  send_email INTEGER NOT NULL DEFAULT 0,
-  email_template_key TEXT,
-  create_task INTEGER NOT NULL DEFAULT 0,
-  task_title TEXT NOT NULL DEFAULT '',
-  is_terminal INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS client_files (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_number TEXT NOT NULL UNIQUE,
-  application_type_id INTEGER REFERENCES application_types(id),
-  stage_id INTEGER REFERENCES stages(id),
-  assigned_broker_id INTEGER REFERENCES users(id),
-  purchase_price REAL,
-  down_payment REAL,
-  mortgage_amount REAL,
-  property_address TEXT NOT NULL DEFAULT '',
-  property_type TEXT NOT NULL DEFAULT '',
-  closing_date TEXT,
-  fthb INTEGER NOT NULL DEFAULT 0,
-  purpose TEXT NOT NULL DEFAULT '',
-  extra_info TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active',
-  created_by INTEGER REFERENCES users(id),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  last_activity_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS applicants (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER NOT NULL REFERENCES client_files(id) ON DELETE CASCADE,
-  role TEXT NOT NULL DEFAULT 'primary',
-  first_name TEXT NOT NULL,
-  middle_name TEXT NOT NULL DEFAULT '',
-  last_name TEXT NOT NULL,
-  preferred_name TEXT NOT NULL DEFAULT '',
-  email TEXT NOT NULL DEFAULT '',
-  phone TEXT NOT NULL DEFAULT '',
-  dob TEXT,
-  address TEXT NOT NULL DEFAULT '',
-  preferred_contact TEXT NOT NULL DEFAULT 'email',
-  employment_type TEXT NOT NULL DEFAULT '',
-  employer_name TEXT NOT NULL DEFAULT '',
-  job_title TEXT NOT NULL DEFAULT '',
-  employment_notes TEXT NOT NULL DEFAULT '',
-  portal_user_id INTEGER REFERENCES users(id),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS document_types (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  key TEXT UNIQUE,
-  name TEXT NOT NULL,
-  category TEXT NOT NULL DEFAULT 'other',
-  description TEXT NOT NULL DEFAULT '',
-  active INTEGER NOT NULL DEFAULT 1,
-  sort INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS document_rules (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  conditions TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS document_rule_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  rule_id INTEGER NOT NULL REFERENCES document_rules(id) ON DELETE CASCADE,
-  document_type_id INTEGER NOT NULL REFERENCES document_types(id),
-  requirement TEXT NOT NULL DEFAULT 'required',
-  per_applicant INTEGER NOT NULL DEFAULT 0,
-  expires_days INTEGER,
-  note TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS document_requests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER NOT NULL REFERENCES client_files(id) ON DELETE CASCADE,
-  applicant_id INTEGER REFERENCES applicants(id) ON DELETE SET NULL,
-  document_type_id INTEGER NOT NULL REFERENCES document_types(id),
-  status TEXT NOT NULL DEFAULT 'required',
-  requirement TEXT NOT NULL DEFAULT 'required',
-  source TEXT NOT NULL DEFAULT 'rule',
-  rule_id INTEGER,
-  due_date TEXT,
-  client_message TEXT NOT NULL DEFAULT '',
-  internal_note TEXT NOT NULL DEFAULT '',
-  expires_days INTEGER,
-  expires_at TEXT,
-  current_version_id INTEGER,
-  reminders_enabled INTEGER NOT NULL DEFAULT 1,
-  last_reminder_at TEXT,
-  reminder_count INTEGER NOT NULL DEFAULT 0,
-  client_comment TEXT NOT NULL DEFAULT '',
-  created_by INTEGER,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS document_versions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  request_id INTEGER NOT NULL REFERENCES document_requests(id) ON DELETE CASCADE,
-  version INTEGER NOT NULL,
-  original_name TEXT NOT NULL,
-  display_name TEXT NOT NULL DEFAULT '',
-  stored_name TEXT NOT NULL,
-  mime TEXT NOT NULL,
-  size INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'uploaded',
-  review_note_client TEXT NOT NULL DEFAULT '',
-  review_note_internal TEXT NOT NULL DEFAULT '',
-  uploaded_by INTEGER,
-  uploaded_at TEXT NOT NULL,
-  reviewed_by INTEGER,
-  reviewed_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER NOT NULL REFERENCES client_files(id) ON DELETE CASCADE,
-  sender_id INTEGER NOT NULL REFERENCES users(id),
-  sender_kind TEXT NOT NULL,
-  body TEXT NOT NULL DEFAULT '',
-  attachment_name TEXT,
-  attachment_stored TEXT,
-  attachment_mime TEXT,
-  attachment_size INTEGER,
-  created_at TEXT NOT NULL,
-  edited_at TEXT,
-  read_by_staff_at TEXT,
-  read_by_client_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tasks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER REFERENCES client_files(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  due_date TEXT,
-  priority TEXT NOT NULL DEFAULT 'normal',
-  status TEXT NOT NULL DEFAULT 'pending',
-  assigned_to INTEGER REFERENCES users(id),
-  source TEXT NOT NULL DEFAULT 'manual',
-  created_by INTEGER,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  completed_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS notes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER NOT NULL REFERENCES client_files(id) ON DELETE CASCADE,
-  body TEXT NOT NULL,
-  pinned INTEGER NOT NULL DEFAULT 0,
-  created_by INTEGER,
-  created_at TEXT NOT NULL,
-  updated_by INTEGER,
-  updated_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS stage_history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER NOT NULL REFERENCES client_files(id) ON DELETE CASCADE,
-  from_stage_id INTEGER,
-  to_stage_id INTEGER NOT NULL,
-  changed_by INTEGER,
-  note TEXT NOT NULL DEFAULT '',
-  changed_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS activity_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER,
-  actor_id INTEGER,
-  actor_name TEXT NOT NULL DEFAULT '',
-  kind TEXT NOT NULL,
-  message TEXT NOT NULL,
-  meta TEXT NOT NULL DEFAULT '{}',
-  client_visible INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS audit_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  action TEXT NOT NULL,
-  entity TEXT,
-  entity_id INTEGER,
-  ip TEXT,
-  meta TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS notifications (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL,
-  title TEXT NOT NULL,
-  body TEXT NOT NULL DEFAULT '',
-  file_id INTEGER,
-  link TEXT NOT NULL DEFAULT '',
-  read_at TEXT,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS email_templates (
-  key TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  subject TEXT NOT NULL,
-  body TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  updated_at TEXT,
-  updated_by INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS email_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  to_email TEXT NOT NULL,
-  to_name TEXT NOT NULL DEFAULT '',
-  user_id INTEGER,
-  file_id INTEGER,
-  template_key TEXT,
-  subject TEXT NOT NULL,
-  body TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'queued',
-  error TEXT,
-  created_at TEXT NOT NULL,
-  sent_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS consent_forms (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  body TEXT NOT NULL,
-  version INTEGER NOT NULL DEFAULT 1,
-  active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL,
-  updated_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS consents (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER NOT NULL REFERENCES client_files(id) ON DELETE CASCADE,
-  applicant_id INTEGER REFERENCES applicants(id) ON DELETE SET NULL,
-  form_id INTEGER NOT NULL,
-  form_title TEXT NOT NULL,
-  form_version INTEGER NOT NULL,
-  form_body_snapshot TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'requested',
-  requested_by INTEGER,
-  requested_at TEXT NOT NULL,
-  responded_at TEXT,
-  responded_by INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS counters (
-  key TEXT PRIMARY KEY,
-  value INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_applicants_file ON applicants(file_id);
-CREATE INDEX IF NOT EXISTS idx_applicants_portal_user ON applicants(portal_user_id);
-CREATE INDEX IF NOT EXISTS idx_requests_file ON document_requests(file_id);
-CREATE INDEX IF NOT EXISTS idx_versions_request ON document_versions(request_id);
-CREATE INDEX IF NOT EXISTS idx_messages_file ON messages(file_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_file ON tasks(file_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to, status);
-CREATE INDEX IF NOT EXISTS idx_notes_file ON notes(file_id);
-CREATE INDEX IF NOT EXISTS idx_activity_file ON activity_log(file_id);
-CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read_at);
-CREATE INDEX IF NOT EXISTS idx_email_log_file ON email_log(file_id);
-CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(email, attempted_at);
-`;
-
-db.exec(SCHEMA);
-
-// ---------------------------------------------------------------------------
-// Lightweight migrations: additive schema evolution for existing databases.
-// CREATE TABLE IF NOT EXISTS covers new tables; ensureColumn covers columns
-// added to tables that already exist on disk.
-
-function ensureColumn(table, column, definition) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-  if (!cols.some((c) => c.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+function connectionString() {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    throw new Error(
+      'DATABASE_URL is not set. This application requires PostgreSQL — see docs/DEPLOYMENT.md. ' +
+      'Local SQLite is no longer supported.'
+    );
   }
+  return url;
 }
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS employment_statuses (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  key TEXT UNIQUE,
-  name TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1,
-  sort INTEGER NOT NULL DEFAULT 0
-);
-
--- Client-specific removals of rule-generated checklist items. This is what
--- keeps a broker's per-client edits from being undone the next time the
--- global rules are re-evaluated, and keeps global rules unchanged for
--- every other client.
-CREATE TABLE IF NOT EXISTS checklist_exclusions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER NOT NULL REFERENCES client_files(id) ON DELETE CASCADE,
-  document_type_id INTEGER NOT NULL,
-  applicant_id INTEGER,
-  excluded_by INTEGER,
-  created_at TEXT NOT NULL,
-  UNIQUE (file_id, document_type_id, applicant_id)
-);
-CREATE INDEX IF NOT EXISTS idx_exclusions_file ON checklist_exclusions(file_id);
-
-CREATE TABLE IF NOT EXISTS ai_reviews (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  version_id INTEGER NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
-  request_id INTEGER NOT NULL,
-  file_id INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  attempts INTEGER NOT NULL DEFAULT 0,
-  model TEXT,
-  result TEXT,
-  error TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  completed_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_ai_reviews_status ON ai_reviews(status);
-CREATE INDEX IF NOT EXISTS idx_ai_reviews_version ON ai_reviews(version_id);
-`);
-
-// Temporary-password / forced-change flow.
-ensureColumn('users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
-// Document catalog defaults used when a document is added manually.
-ensureColumn('document_types', 'default_requirement', "TEXT NOT NULL DEFAULT 'required'");
-ensureColumn('document_types', 'default_per_applicant', 'INTEGER NOT NULL DEFAULT 0');
-ensureColumn('document_types', 'default_expires_days', 'INTEGER');
-// OneDrive sync state for client folders and uploaded files.
-ensureColumn('client_files', 'onedrive_folder_id', 'TEXT');
-ensureColumn('client_files', 'onedrive_folder_path', 'TEXT');
-ensureColumn('client_files', 'onedrive_status', 'TEXT');
-ensureColumn('client_files', 'onedrive_attempts', 'INTEGER NOT NULL DEFAULT 0');
-ensureColumn('client_files', 'onedrive_error', 'TEXT');
-ensureColumn('document_versions', 'onedrive_item_id', 'TEXT');
-ensureColumn('document_versions', 'onedrive_path', 'TEXT');
-ensureColumn('document_versions', 'onedrive_status', 'TEXT');
-ensureColumn('document_versions', 'onedrive_attempts', 'INTEGER NOT NULL DEFAULT 0');
-ensureColumn('document_versions', 'onedrive_error', 'TEXT');
-
-function run(sql, ...params) {
-  return db.prepare(sql).run(...params);
+/**
+ * TLS: managed providers (Supabase, RDS) terminate TLS with a public CA.
+ * PGSSLMODE=no-verify is available for local sockets and self-signed setups,
+ * but verification stays on by default so a production misconfiguration
+ * fails loudly instead of silently downgrading.
+ */
+function sslConfig() {
+  const url = process.env.DATABASE_URL || '';
+  if (url.includes('host=/') || url.startsWith('postgres://postgres@/')) return false; // unix socket
+  const mode = (process.env.PGSSLMODE || '').toLowerCase();
+  if (mode === 'disable') return false;
+  if (mode === 'no-verify') return { rejectUnauthorized: false };
+  return { rejectUnauthorized: true };
 }
 
-function get(sql, ...params) {
-  return db.prepare(sql).get(...params);
+let pool = null;
+
+function getPool() {
+  if (!pool) {
+    pool = new Pool({
+      connectionString: connectionString(),
+      ssl: sslConfig(),
+      // Serverless-friendly: small pool, short idle, fail fast rather than
+      // queueing behind an exhausted connection limit.
+      max: Number(process.env.PG_POOL_MAX) || 10,
+      idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT) || 30000,
+      connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT) || 10000,
+      statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT) || 15000,
+    });
+    pool.on('error', (err) => {
+      console.error('[db] idle client error:', err.message);
+    });
+  }
+  return pool;
 }
 
-function all(sql, ...params) {
-  return db.prepare(sql).all(...params);
+/** Rewrite `?` placeholders to $1..$n, ignoring those inside string literals. */
+function toPg(sql) {
+  let out = '';
+  let n = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql[i];
+    if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === '"' && !inSingle) inDouble = !inDouble;
+    if (c === '?' && !inSingle && !inDouble) {
+      out += '$' + ++n;
+    } else {
+      out += c;
+    }
+  }
+  return out;
 }
 
-/** Run fn inside a transaction; rolls back on throw. */
-function tx(fn) {
-  db.exec('BEGIN');
+function executor() {
+  return txStore.getStore() || getPool();
+}
+
+async function query(sql, params) {
   try {
-    const result = fn();
-    db.exec('COMMIT');
-    return result;
+    return await executor().query(toPg(sql), params);
   } catch (err) {
-    db.exec('ROLLBACK');
+    // Surface the failing statement in logs without leaking parameter values
+    // (which routinely contain client PII).
+    err.message = `${err.message} [sql: ${String(sql).replace(/\s+/g, ' ').slice(0, 200)}]`;
     throw err;
   }
 }
 
-function getSetting(key, fallback) {
-  const row = get('SELECT value FROM settings WHERE key = ?', key);
+async function run(sql, ...params) {
+  const res = await query(sql, params);
+  return { rowCount: res.rowCount, changes: res.rowCount, rows: res.rows };
+}
+
+async function get(sql, ...params) {
+  const res = await query(sql, params);
+  return res.rows[0];
+}
+
+async function all(sql, ...params) {
+  const res = await query(sql, params);
+  return res.rows;
+}
+
+/** INSERT helper returning the new id. Appends RETURNING id when absent. */
+async function insert(sql, ...params) {
+  const text = /returning/i.test(sql) ? sql : `${sql} RETURNING id`;
+  const res = await query(text, params);
+  return res.rows[0] ? res.rows[0].id : null;
+}
+
+/**
+ * Run fn inside a transaction. Nested tx() calls join the outer transaction
+ * rather than opening a second one.
+ */
+async function tx(fn) {
+  const existing = txStore.getStore();
+  if (existing) return fn(existing);
+
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const result = await txStore.run(client, () => fn(client));
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* connection already broken */ }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Schema
+
+async function migrate() {
+  const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
+  await getPool().query(schema);
+  await getPool().query(
+    'INSERT INTO schema_migrations (version, applied_at) VALUES (1, $1) ON CONFLICT (version) DO NOTHING',
+    [now()]
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+
+async function getSetting(key, fallback) {
+  const row = await get('SELECT value FROM settings WHERE key = ?', key);
   if (!row) return fallback;
   return parseJsonSafe(row.value, fallback);
 }
 
-function setSetting(key, value) {
-  run(
-    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+async function setSetting(key, value) {
+  await run(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
     key,
     JSON.stringify(value)
   );
 }
 
-/** Next sequential number for a counter key (transaction-safe when called inside tx). */
-function nextCounter(key) {
-  run('INSERT INTO counters (key, value) VALUES (?, 0) ON CONFLICT(key) DO NOTHING', key);
-  run('UPDATE counters SET value = value + 1 WHERE key = ?', key);
-  return get('SELECT value FROM counters WHERE key = ?', key).value;
+/**
+ * Next value for a counter. The UPDATE ... RETURNING is atomic, so two
+ * concurrent client creations can never receive the same file number.
+ */
+async function nextCounter(key) {
+  await run('INSERT INTO counters (key, value) VALUES (?, 0) ON CONFLICT (key) DO NOTHING', key);
+  const row = await get('UPDATE counters SET value = value + 1 WHERE key = ? RETURNING value', key);
+  return row.value;
 }
 
-function nextFileNumber() {
+async function nextFileNumber() {
   const year = new Date().getUTCFullYear();
-  const seq = nextCounter(`file:${year}`);
+  const seq = await nextCounter(`file:${year}`);
   return `MTG-${year}-${String(seq).padStart(5, '0')}`;
 }
 
-function touchFile(fileId) {
-  run('UPDATE client_files SET last_activity_at = ?, updated_at = ? WHERE id = ?', now(), now(), fileId);
+async function touchFile(fileId) {
+  await run('UPDATE client_files SET last_activity_at = ?, updated_at = ? WHERE id = ?', now(), now(), fileId);
+}
+
+async function close() {
+  if (pool) {
+    const p = pool;
+    pool = null;
+    await p.end();
+  }
+}
+
+/** Liveness + writability probe for readiness checks. */
+async function healthCheck() {
+  const started = Date.now();
+  await get('SELECT 1 AS ok');
+  return { ok: true, latency_ms: Date.now() - started };
 }
 
 module.exports = {
-  db,
-  DATA_DIR,
+  getPool,
+  query,
   run,
   get,
   all,
+  insert,
   tx,
+  migrate,
   getSetting,
   setSetting,
   nextCounter,
   nextFileNumber,
   touchFile,
+  close,
+  healthCheck,
+  toPg,
 };

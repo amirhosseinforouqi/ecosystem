@@ -11,327 +11,336 @@ documents from their phone → the broker reviews, communicates and moves the
 file through stages → the platform reminds the right person when something
 needs attention.
 
+Going live with real client data? Read **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
+— it is the authoritative checklist, and the application enforces most of it at
+startup.
+
 ## Demo it in GitHub Codespaces
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/amirhosseinforouqi/ecosystem/tree/claude/mortgage-client-platform-xsxg4g)
 
-No local setup needed. Click the badge (or, on this branch, use the **Code**
-button → **Codespaces** tab → **Create codespace on branch**) and the
-container will:
+Click the badge (or **Code** → **Codespaces** → **Create codespace on branch**).
+The container brings up PostgreSQL 16 alongside the app, generates a set of
+secrets for that container only, applies the schema and seeds three sample
+clients in different stages.
 
-1. Install nothing extra — the platform has zero runtime dependencies.
-2. Seed demo data automatically (`.devcontainer/postCreateCommand`) — three
-   sample clients in different stages, ready to explore.
-3. Start the server in the background and forward port 3000, opening a
-   preview automatically.
-
-Once it's up, sign in with:
-
-| Portal | URL | Email | Password |
-|---|---|---|---|
-| Broker | `/broker` | `admin@example.com` | `admin1234` |
-| Client | `/portal` | `john.demo@example.com` | `Demo1234pass` |
-
-(Two more demo clients — `sarah.demo@example.com` and `david.demo@example.com`,
-same password — show a couple's refinance and a completed-checklist file
-submitted to the lender.)
-
-If the preview doesn't open automatically, check the **Ports** tab in the
-Codespace for the forwarded `3000` URL, or run `bash .devcontainer/start.sh`
-in the terminal. Since this branch hasn't been merged yet, Codespaces must be
-created from the branch directly (the link above does that).
-
-**Want a blank slate instead** — e.g. to walk someone through the "create a
-client" flow step by step from an empty dashboard? In the Codespace terminal:
+**There is no default password anywhere.** The generated administrator
+credentials are written to `.devcontainer/.env.local` (git-ignored), and the
+demo seeder prints the client portal password once:
 
 ```bash
-npm run reset:broker-only   # wipes local data, leaves just the broker account
-pkill -f "node.*server/index.js"
+cat .devcontainer/.env.local          # ADMIN_EMAIL / ADMIN_PASSWORD
+```
+
+Administrators must also complete two-step verification at first sign-in. The
+setup screen shows a key to type into any authenticator app (Microsoft
+Authenticator, Google Authenticator, 1Password…), and the seeder prints an
+`otpauth://` link you can open on your phone.
+
+If the preview doesn't open automatically, check the **Ports** tab for the
+forwarded `3000` URL, or run `bash .devcontainer/start.sh`.
+
+**Want a blank slate** — to walk someone through the "create a client" flow from
+an empty dashboard?
+
+```bash
+npm run reset:broker-only -- --confirm   # keeps configuration and staff, removes every client
+pkill -f "node server/index.js"
 bash .devcontainer/start.sh
 ```
 
-Then sign in to `/broker` as `admin@example.com` / `admin1234` — zero clients,
-ready for a live walkthrough. Run `npm run seed:demo` (after stopping the
-server) any time to bring the three sample clients back.
+Run `npm run seed:demo` any time to bring the three sample clients back.
 
-## Quick start
+## Quick start (local)
 
-Requires **Node.js 22.5+**. There are **zero runtime dependencies** — nothing
-to install.
+Requires **Node.js 22+** and a **PostgreSQL 14+** database. There is exactly one
+runtime dependency (`pg`).
 
 ```bash
-npm start                 # start the platform on http://localhost:3000
-npm run seed:demo         # optional: seed 3 demo clients to explore with
-npm run reset:broker-only # optional: wipe data, leave just the broker account
-npm test                  # run the end-to-end scenario tests
-```
+# 1. A database
+createdb mortgage
+export DATABASE_URL=postgres://localhost:5432/mortgage
 
-On first start an admin account is created and printed to the console
-(or set `ADMIN_EMAIL` / `ADMIN_PASSWORD` beforehand). Then:
+# 2. Document encryption keys — uploads are refused without them
+npm run keygen        # prints DOCUMENT_ENCRYPTION_KEYS and DOCUMENT_ENCRYPTION_ACTIVE_KEY
+export DOCUMENT_ENCRYPTION_KEYS=... DOCUMENT_ENCRYPTION_ACTIVE_KEY=v1
+
+# 3. Schema + the first administrator (a password is generated and printed once)
+export ADMIN_EMAIL=you@yourbrokerage.com
+npm run migrate
+
+# 4. Run it
+npm start
+```
 
 - **Broker portal:** `http://localhost:3000/broker`
 - **Client portal:** `http://localhost:3000/portal`
 
-Configuration is via environment variables: `PORT`, `DATA_DIR` (database +
-uploads location, default `./data`), `APP_URL` (public URL used in email
-links), `EMAIL_TRANSPORT` (`log` | `disabled` | `smtp`), `FORCE_SECURE_COOKIES=1`
-(behind HTTPS termination that doesn't set `x-forwarded-proto`).
+Other commands:
 
-## Connect a real email account
+```bash
+npm test                          # the full test suite (needs TEST_DATABASE_URL)
+npm run seed:demo                 # three demo clients to explore with
+npm run reset:broker-only -- --confirm
+npm run backup                    # database rows + encrypted documents
+npm run restore -- <dir> --confirm
+npm run jobs                      # run the background passes once
+```
 
-By default, emails aren't actually delivered — every one is still rendered
-and recorded (Settings → Email templates / a file's Emails tab), just not
-sent, so you can develop and demo without spamming anyone. To have the
-platform send real email through a mailbox you already own — Gmail or
-Outlook/Microsoft 365 both work, for free, no third-party service needed —
-set `EMAIL_TRANSPORT=smtp` plus:
+`npm test` creates and drops its own databases; point `TEST_DATABASE_URL` at a
+server it may do that on, e.g.
+`TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres npm test`.
 
-| Variable | Example | Notes |
-|---|---|---|
-| `SMTP_HOST` | `smtp.gmail.com` | see provider table below |
-| `SMTP_PORT` | `587` | 587 = STARTTLS (typical), 465 = implicit TLS |
-| `SMTP_USER` | `you@gmail.com` | your full email address |
-| `SMTP_PASS` | `abcd efgh ijkl mnop` | an **app password**, not your normal login password |
-| `SMTP_FROM` | `you@gmail.com` | optional, defaults to `SMTP_USER` |
-| `SMTP_FROM_NAME` | `Jane Broker` | optional display name |
+## Connect Microsoft 365 (Outlook email + OneDrive/SharePoint storage)
 
-**Getting an app password (free, ~2 minutes):**
+Client email and document filing run on **one** Microsoft Entra app registration
+using OAuth client credentials. Your mailbox password is never entered into or
+stored by this application.
 
-- **Gmail** — turn on 2-Step Verification at [myaccount.google.com/security](https://myaccount.google.com/security), then go to **App passwords**, create one for "Mail", and use the 16-character code as `SMTP_PASS`. Host: `smtp.gmail.com`, port `587`.
-- **Outlook / Microsoft 365** — turn on 2-step verification at [account.microsoft.com/security](https://account.microsoft.com/security), then **Create a new app password** and use it as `SMTP_PASS`. Host: `smtp.office365.com` (work/school account) or `smtp-mail.outlook.com` (personal outlook.com/hotmail.com), port `587`.
+1. **App registrations → New registration.** Copy the **Application (client) ID**
+   and **Directory (tenant) ID**.
+2. **Certificates & secrets → New client secret.** Copy the value immediately —
+   it is shown only once.
+3. **API permissions → Microsoft Graph → Application permissions:** `Mail.Send`
+   and `Files.ReadWrite.All` (OneDrive) or `Sites.ReadWrite.All` (SharePoint).
+   Then **Grant admin consent**.
 
-**In a Codespace**, don't type the password into the terminal each session —
-store it once as a [Codespaces secret](https://github.com/settings/codespaces)
-(`SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, and set `EMAIL_TRANSPORT=smtp`) and it's
-injected automatically into every future codespace on this repo.
+```bash
+EMAIL_TRANSPORT=graph
+MS_TENANT_ID=<tenant id>
+MS_CLIENT_ID=<client id>
+MS_CLIENT_SECRET=<secret value>
+MS_MAILBOX=broker@yourbrokerage.com
+ONEDRIVE_TARGET=user                  # or "sharepoint" with SHAREPOINT_SITE_ID
+ONEDRIVE_ROOT="Mortgage Clients"
+```
 
-**Test it** without touching the app's data:
+`Mail.Send` grants send rights for *every* mailbox in the tenant; narrow it to
+one with an [application access policy](https://learn.microsoft.com/graph/auth-limit-mailbox-access).
+Settings → Integrations shows live connection status.
+
+### SMTP instead
+
+Prefer a plain mailbox? `EMAIL_TRANSPORT=smtp` with `SMTP_HOST`, `SMTP_PORT`,
+`SMTP_USER`, `SMTP_PASS` (an **app password**, never your login password),
+`SMTP_FROM`. Gmail: `smtp.gmail.com:587`. Outlook: `smtp.office365.com:587`.
+
+Test it without touching any data:
 
 ```bash
 npm run test:email -- you@example.com
 ```
 
-This sends one real email using your configured account so you can confirm
-it works before creating any clients. Delivery uses a small zero-dependency
-SMTP client built on Node's own `net`/`tls` modules (`server/smtp.js`) — no
-external mail package, and it's covered by `npm test` against a real
-STARTTLS conversation, not a stub.
+Delivery uses a small zero-dependency SMTP client built on Node's own
+`net`/`tls` (`server/smtp.js`), covered by tests against a real STARTTLS
+conversation rather than a stub.
 
-## Connect Microsoft 365 (Outlook email + OneDrive storage)
+## Connect Claude document review (optional, off by default)
 
-Both the client emails and the document storage run on **one** Microsoft Entra
-app registration using OAuth client credentials. Your mailbox password is
-never entered into or stored by this application.
+Uploaded documents can be reviewed in the background by Claude using the
+reusable skill at `skills/document-review/SKILL.md` — that file *is* the system
+prompt, so review behaviour changes by editing it, not the code.
 
-**One-time setup in the Azure portal** (portal.azure.com → Microsoft Entra ID):
+Turning this on requires **three** independent things, so no client document can
+reach Anthropic by accident:
 
-1. **App registrations → New registration.** Name it (e.g. "Mortgage
-   Platform"), single tenant, no redirect URI. Copy the
-   **Application (client) ID** and **Directory (tenant) ID**.
-2. **Certificates & secrets → New client secret.** Copy the secret *value*
-   immediately — it is shown only once.
-3. **API permissions → Add a permission → Microsoft Graph → Application
-   permissions**, add:
-   - `Mail.Send` — send client email from your mailbox
-   - `Files.ReadWrite.All` — write documents into your OneDrive
-   Then click **Grant admin consent**. (Application permissions require an
-   admin; without consent every call returns 403.)
-4. Note the mailbox/user principal name whose Outlook and OneDrive you want
-   used, e.g. `broker@yourbrokerage.com`.
+1. Server: `AI_DOCUMENT_REVIEW_ENABLED=true`, `ANTHROPIC_API_KEY`, and
+   `AI_PROCESSING_AGREEMENT_REF` (your data-processing agreement reference).
+2. Brokerage: Settings → AI review → enabled.
+3. Client: consent recorded on that client's file.
 
-**Environment variables:**
-
-```bash
-EMAIL_TRANSPORT=graph                 # send through Microsoft 365
-MS_TENANT_ID=<Directory (tenant) ID>
-MS_CLIENT_ID=<Application (client) ID>
-MS_CLIENT_SECRET=<client secret value>
-MS_MAILBOX=broker@yourbrokerage.com   # mailbox + OneDrive used by the platform
-ONEDRIVE_ROOT="Mortgage Clients"      # optional; top-level folder name
-```
-
-Setting these turns on both integrations. Settings → Integrations in the
-broker portal shows live connection status for each.
-
-Optional narrowing: `Mail.Send` grants the app send rights for *every*
-mailbox in the tenant. To restrict it to the one mailbox, apply an
-[application access policy](https://learn.microsoft.com/graph/auth-limit-mailbox-access)
-in Exchange Online.
-
-## Connect Claude document review
-
-Uploaded documents are reviewed in the background by Claude using the
-reusable skill at `skills/document-review/SKILL.md` — that file *is* the
-system prompt, so you change review behavior by editing it, not the code.
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-...      # from console.anthropic.com
-ANTHROPIC_MODEL=claude-opus-5     # optional; this is the default
-```
-
-Reviews never block an upload: the client's upload succeeds immediately, the
-review runs on a background pass, retries on failure, and results are stored
-in the `ai_reviews` table. The output is **internal to the brokerage** — it
-never reaches the client portal or any client email, and it never approves
-or rejects anything. The broker makes every decision.
+With any one missing, nothing is sent and the review is recorded as `disabled`.
+Reviews never block an upload, retry on failure, and are stored encrypted. The
+output is **internal to the brokerage** — it never reaches the client portal or
+any client email, and it never approves or rejects anything. The broker makes
+every decision.
 
 ## The two experiences
 
 **Broker portal** (`/broker`) — an *action dashboard*, not a client list:
 documents awaiting review, files waiting on client documents, unread client
-messages, follow-ups due today and overdue, and a ranked "Needs your
-attention" list where every item is one click from the relevant file. Plus
-clients with search/filters/saved views and bulk actions, a fast one-page
-client creation form with duplicate protection, full client files (overview,
-documents, chat, tasks, private notes, activity timeline, email history),
-tasks, lightweight reports, notifications, and a settings area.
+messages, follow-ups due today and overdue, and a ranked "Needs your attention"
+list where every item is one click from the relevant file. Plus clients with
+search/filters/bulk actions, a guided client creation wizard with duplicate
+protection, full client files (overview, documents, chat, tasks, private notes,
+activity timeline, email history), tasks, reports, notifications and settings.
 
-**Client portal** (`/portal`) — mobile-first and deliberately minimal. A
-client sees within seconds: where their mortgage stands (visual 6-step
-progress tracker with friendly wording), a single clear **next step**, exactly
-which documents are needed (with the broker's reason when a replacement is
-requested), and a chat button to their broker. Uploads support drag-and-drop,
-multi-file, and phone camera capture (PDF/JPG/PNG/HEIC/WEBP); filenames are
-auto-matched to checklist items and the broker can always reclassify.
+**Client portal** (`/portal`) — mobile-first and deliberately minimal. A client
+sees within seconds: where their mortgage stands (visual 6-step progress
+tracker with friendly wording), a single clear **next step**, exactly which
+documents are needed (with the broker's reason when a replacement is requested),
+and a chat button to their broker. Uploads support drag-and-drop, multi-file and
+phone camera capture (PDF/JPG/PNG/HEIC/WEBP); filenames are auto-matched to
+checklist items and the broker can always reclassify.
 
 ## Key mechanics
 
-- **Guided client creation** — Add Client is a four-step wizard: pick the
-  service, pick the employment status, review the checklist the rules
-  generated (add/remove/edit any item for this client), then enter details.
-  Creating the client also creates the portal account, generates a secure
-  temporary password, creates the OneDrive folder tree, and sends the
-  welcome email — automatically.
-- **Temporary password flow** — the client signs in with the credentials
-  from their welcome email and *must* set their own password before any
-  portal data is reachable. Passwords are only ever stored as scrypt
-  hashes; changing the password replaces the hash, so the temporary one
-  stops working immediately. The stored copy of the welcome email has the
-  temporary password redacted.
-- **Three separate document layers** —
-  **catalog** (Settings → Document catalog: every document kind, its
-  category and its client-facing instructions) →
-  **rules** (Settings → Document rules: service + employment ⇒ defaults) →
-  **client checklist** (what one specific client actually owes).
-  Editing one client's checklist records a per-file exclusion, so re-running
-  the rules never re-adds it *and* every other client keeps the full
-  default. Removed items are restorable per client.
-- **Document requirement engine** — brokers configure combinable IF/THEN
-  rules (Settings → Document rules), e.g. *IF application type is Purchase
-  AND applicant is an employee THEN require T4, pay stub (valid 60 days),
-  employment letter, NOA — per applicant*. Checklists are generated and
-  re-synced automatically when application type, FTHB status, or applicants
-  change. No manual checklist building, no coding.
-- **Upload pipeline** — validate → store → return success to the client →
-  (background) Claude review with the project skill → structured result in
-  the database → original copied to OneDrive under the client's file number
-  → broker notified. Every stage is retryable; a Claude or Microsoft outage
-  never loses a document.
-- **Multi-applicant files** — co-borrowers, spouses, guarantors; each with
-  their own employment info, per-applicant documents, and optional portal
-  access. Every document is labelled with the applicant it belongs to.
+- **Guided client creation** — a four-step wizard: pick the service, pick the
+  employment status, review the checklist the rules generated (add/remove/edit
+  any item for this client), then enter details. Creating the client also
+  creates the portal account, generates a secure temporary password, creates the
+  OneDrive folder tree and sends the welcome email — automatically.
+- **Temporary password flow** — the client signs in with the credentials from
+  their welcome email and *must* set their own password before any portal data
+  is reachable. Passwords are only ever stored as scrypt hashes; changing the
+  password replaces the hash, so the temporary one stops working immediately.
+  The stored copy of the welcome email has the temporary password redacted.
+- **Three separate document layers** — **catalog** (every document kind, its
+  category and client-facing instructions) → **rules** (service + employment ⇒
+  defaults) → **client checklist** (what one client actually owes). Editing one
+  client's checklist records a per-file exclusion, so re-running the rules never
+  re-adds it *and* every other client keeps the full default. Removed items are
+  restorable per client.
+- **Document requirement engine** — combinable IF/THEN rules, e.g. *IF
+  application type is Purchase AND applicant is an employee THEN require T4, pay
+  stub (valid 60 days), employment letter, NOA — per applicant*. Checklists
+  re-sync automatically when application type, FTHB status or applicants change.
+- **Upload pipeline** — validate → encrypt → store → return success to the
+  client → (background) malware scan → Claude review → original copied to
+  OneDrive under the client's file number → broker notified. Every stage is
+  retryable; an outage never loses a document.
+- **Multi-applicant files** — co-borrowers, spouses, guarantors; each with their
+  own employment info, per-applicant documents and optional portal access. By
+  default each applicant sees only their own documents plus the file-level ones;
+  a broker can deliberately mark applicants as sharing.
 - **Document review with version history** — approve / reject / request
-  replacement with a required client-facing reason; replaced documents keep
-  every version and review outcome permanently. Optional validity windows
-  flag approved documents that expire.
-- **Configurable stages** — add/rename/reorder/disable stages, set colors,
-  client-facing wording, progress-tracker step, and per-stage automation
-  (email the client, create a task). Stage history is preserved.
-- **Automatic reminders** — configurable cadence (e.g. 2/5/7 days), max
-  count, and minimum spacing; reminders stop the moment a document arrives.
-  Manual and bulk reminders respect the same anti-spam limits.
-- **Email as a notification layer** — every message a client receives by
-  email also exists in the portal (the portal is the source of truth).
-  Templates are editable with placeholders and live preview; every send is
-  recorded in a per-file email history. Delivery is a pluggable transport
-  (outbox pattern) ready for a real SMTP/Gmail/Microsoft 365 integration.
-- **Tasks & notes** — manual and automatic tasks (e.g. "Review the client's
-  document package" when everything is in), due dates, priorities,
-  assignment; pinned private notes that clients can never see.
-- **Activity & audit** — a human-readable per-file timeline, plus an
-  append-only audit log (logins, uploads, downloads, approvals, stage and
-  permission changes...) with no edit/delete endpoints.
-- **Digital consents** — the brokerage uploads its own consent/disclosure
-  wording; the exact version each client accepted is snapshotted with
-  date, time and identity. (No legal wording is invented by the platform.)
+  replacement with a required client-facing reason; replaced documents keep every
+  version and review outcome permanently. Optional validity windows flag approved
+  documents that expire.
+- **Configurable stages** — add/rename/reorder/disable, set colours,
+  client-facing wording, progress-tracker step, and per-stage automation (email
+  the client, create a task). Stage history is preserved.
+- **Automatic reminders** — configurable cadence, maximum count and minimum
+  spacing; reminders stop the moment a document arrives. Manual and bulk
+  reminders respect the same anti-spam limits.
+- **Email as a notification layer** — every message a client receives by email
+  also exists in the portal (the portal is the source of truth). Templates are
+  editable with placeholders and live preview; every send is recorded per file.
+- **Tasks & notes** — manual and automatic tasks, due dates, priorities,
+  assignment; pinned private notes clients can never see.
+- **Activity & audit** — a human-readable per-file timeline, plus an append-only
+  audit log whose rows are hash-chained, so tampering is detectable
+  (`GET /api/broker/audit/verify`).
+- **Digital consents** — the brokerage uploads its own consent wording; the exact
+  version each client accepted is snapshotted with date, time and identity.
 
 ## Security
 
-- scrypt password hashing (never plaintext), strong-password enforcement
-- DB-backed sessions in HttpOnly SameSite cookies; `Secure` behind HTTPS
-- Login rate limiting per IP + temporary account lockout after repeated failures
-- Single-use, expiring activation and password-reset tokens (stored hashed)
-- **Server-side authorization everywhere**: role-based permissions for staff
-  (admin/manager/broker/processor/assistant, editable permission matrix), and
-  client access derived exclusively from applicant↔file links — a client
-  changing IDs in URLs/API calls gets 404s (verified by automated tests)
-- CSRF protection (custom header requirement), strict CSP, no-sniff/frame headers
-- Uploads: size limits, extension allowlist, magic-byte content validation;
-  files stored outside the web root with random names and streamed only
-  through permission-checked endpoints; downloads are audit-logged
-- Friendly client-facing error messages; diagnostics stay server-side
-- Files are archived (completed/cancelled/archived states), never silently
-  deleted; retention policy is configurable to match the brokerage's own
-  legal obligations
+- **Passwords** — scrypt hashing, never plaintext. Minimum lengths are
+  configurable (12 for staff, 10 for clients by default), common and personal
+  passwords are rejected, and optional Have I Been Pwned checking uses
+  k-anonymity so the password never leaves the server.
+- **Two-step verification** — TOTP, mandatory for staff roles (administrators can
+  never be exempted), with single-use recovery codes and replay protection. The
+  password step alone issues no session.
+- **Sessions** — database-backed, in HttpOnly SameSite cookies, `Secure` in
+  production, with both an idle timeout and a non-extending absolute lifetime.
+  A role change or account disable drops every existing session immediately.
+- **Rate limiting** — database-backed, so the limits hold across serverless
+  instances and restarts, on sign-in, password reset, MFA verification, uploads
+  and the API as a whole. `X-Forwarded-For` is ignored unless `TRUST_PROXY` says
+  a proxy is actually there.
+- **Documents encrypted at rest** — AES-256-GCM envelope encryption with
+  rotatable keys. Without keys the application refuses uploads rather than
+  silently storing plaintext. Backups carry the same encryption.
+- **Malware scanning** — uploads are scanned (ClamAV) and their bytes are not
+  served until they are clean. Production refuses to start without either a
+  scanner or an explicit, documented decision to run without one.
+- **Server-side authorization everywhere** — role-based permissions for staff
+  with an editable matrix; client access derived exclusively from applicant↔file
+  links. A client changing ids in URLs or API calls gets 404s. Opening a document
+  inline requires the same permission as downloading it.
+- **Transport & browser hardening** — HSTS, strict CSP, `frame-ancestors 'none'`,
+  nosniff, CSRF protection via a required custom header plus an Origin check, and
+  a sandboxed CSP on served documents.
+- **Errors** — friendly client-facing messages; diagnostics stay server-side and
+  go to Sentry with PII scrubbed.
+- **Retention** — files are archived, never silently deleted; the retention
+  policy is configurable to match the brokerage's own obligations.
 
 ## Architecture
 
 ```
 server/
-  index.js        HTTP server, static files, security headers, routing
+  app.js          the HTTP application: security headers, ctx, routing, errors
+  index.js        long-running server: port binding, scheduler, graceful shutdown
   router.js       tiny method+pattern router
-  db.js           SQLite (node:sqlite), schema, helpers
+  db.js           PostgreSQL data layer (pg), transactions, migrations
+  schema.sql      the whole schema, idempotent
   seed.js         default stages/types/rules/templates/permissions
   auth.js         passwords, temporary credentials, sessions, RBAC, isolation
+  mfa.js          TOTP second factor and recovery codes
+  ratelimit.js    database-backed rate limiting
+  crypto-store.js AES-256-GCM envelope encryption for documents and results
+  scan.js         ClamAV malware scanning
   checklist.js    document requirement engine + per-client customization
   nextstep.js     client "next step" + broker attention computation
-  reminders.js    background scheduler (reminders, expiry, AI review, OneDrive)
-  emails.js       template rendering + pluggable outbox transport
-  smtp.js         zero-dependency SMTP client (app-password mailboxes)
+  jobs.js         background passes (reminders, expiry, scan, AI, OneDrive)
+  backup.js       portable backup and restore
+  emails.js       template rendering + pluggable transport
+  smtp.js         zero-dependency SMTP client
   msgraph.js      Microsoft Graph client (OAuth client credentials)
-  onedrive.js     OneDrive folder tree + background document sync
-  ai-review.js    Claude document review pipeline (queued, retryable)
-  notify.js       in-portal notifications
-  storage.js      document storage abstraction (local working copy)
-  log.js          activity timeline + append-only audit log
-  serialize.js    API shapes incl. friendly client-facing statuses
-  routes/         auth / broker / client / settings APIs
+  onedrive.js     OneDrive/SharePoint folder tree + background document sync
+  ai-review.js    Claude document review pipeline (gated, queued, retryable)
+  storage.js      encrypted document storage
+  log.js          activity timeline + hash-chained audit log
+  sentry.js       error reporting with PII scrubbing
+  serialize.js    API shapes, strictly separate client and broker views
+  routes/         auth / broker / client / settings / ops APIs
+api/index.js      Vercel entry point (same handler as npm start)
 skills/
-  document-review/SKILL.md   the reusable Claude review skill (= system prompt)
+  document-review/SKILL.md   the Claude review skill (= system prompt)
 public/           two vanilla-JS SPAs (broker/, portal/) + shared design system
-tests/            scenarios / integrations / checklist / smtp suites
-scripts/          demo seeder, broker-only reset, test email
+tests/            security / workflow / checklist / backup / integrations / smtp
+scripts/          migrate, keygen, backup, restore, jobs, demo seed, reset
+docs/DEPLOYMENT.md  production deployment and go-live checklist
 ```
 
-Deliberate choices, per the product's phased plan:
+Deliberate choices:
 
-- **SQLite + local file storage** keep operations simple for a single
-  brokerage; `storage.js` and `emails.js` are the seams where cloud document
-  storage (Drive/OneDrive/SharePoint) and mailbox integrations
-  (Gmail/Outlook) plug in without touching callers.
-- **No frameworks** — fast loads, no build step, tiny attack surface, and
-  the whole codebase is readable in an afternoon.
-- **Future-ready, not future-built**: appointments, e-signature providers,
-  SMS, lender submission systems and AI-assisted classification all have
-  natural extension points (see `emails.js`, `storage.js`, consent records,
-  and the request/version model) but are intentionally not in Phase 1.
+- **PostgreSQL**, so the same engine runs locally, in the demo container and in
+  production, and so managed backup and point-in-time recovery are available.
+- **One runtime dependency** (`pg`). Everything else — SMTP, TOTP, Graph, the
+  Anthropic API, malware scanning, encryption — is built on Node's standard
+  library, which keeps the supply-chain surface close to zero.
+- **No frontend framework** — fast loads, no build step, small attack surface,
+  and the whole codebase is readable in an afternoon.
+- **Deployment-shape agnostic** — `server/app.js` is a plain request handler, so
+  the identical code runs behind `npm start` and behind Vercel's Node runtime.
 
 ## Tests
 
-`npm test` runs end-to-end API tests for the ten acceptance scenarios from
-the product spec — client creation with automatic checklist and welcome
-email, activation/first login, uploads with content sniffing, review and
-rejection with client-visible reasons, replacement with preserved version
-history, chat with notifications, stage changes with configured emails,
-follow-up tasks — plus dedicated security tests: cross-client isolation at
-the API level (Scenario 10), account lockout, CSRF, duplicate protection,
-and role permission enforcement.
+```bash
+TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres npm test
+```
+
+Every suite runs against the real HTTP API with its own database, never against
+internal functions, because the API is the boundary a client or an attacker
+actually reaches.
+
+- `security.test.js` — unauthenticated access, client-to-client isolation,
+  applicant-to-applicant isolation, role permissions and the preview/download
+  gate, encryption at rest and tamper detection, credentials, MFA, rate
+  limiting, CSRF, response hardening, audit-chain verification.
+- `workflow.test.js` — the ten acceptance scenarios from the product spec,
+  end to end.
+- `checklist.test.js` — the three document layers, and that one client's edits
+  never change another client's defaults.
+- `backup.test.js` — a real disaster drill: back up, wipe the database and the
+  document store, restore, confirm documents still decrypt.
+- `integrations.test.js` — Microsoft Graph and the Anthropic API against local
+  servers speaking the real protocols, plus the three AI consent gates.
+- `smtp.test.js` — a real STARTTLS + AUTH LOGIN + DATA conversation.
 
 ## Operational notes
 
-- **Backups:** the whole state is `DATA_DIR` (SQLite DB + `uploads/`).
-  Snapshot that directory on a schedule; SQLite's WAL mode keeps copies
-  consistent via `sqlite3 .backup` or filesystem snapshots.
-- **Health:** `GET /health` for monitoring; errors are logged server-side.
-- **HTTPS:** run behind a TLS-terminating proxy; `Secure` cookies switch on
-  automatically via `x-forwarded-proto`.
+- **Health:** `GET /health` (liveness, no dependencies) and `GET /ready`
+  (proves the database is reachable).
+- **Background work:** a long-running server ticks the passes in process. A
+  serverless deployment has no timers, so `vercel.json` points a cron at
+  `/api/cron/jobs`, authenticated with `CRON_SECRET`.
+- **Backups:** `npm run backup` captures database rows *and* the encrypted
+  document blobs, and verifies what it wrote. Practise a restore before go-live
+  — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- **HTTPS:** required in production. Set `FORCE_SECURE_COOKIES=1` and
+  `TRUST_PROXY` to the number of proxies in front of the app.

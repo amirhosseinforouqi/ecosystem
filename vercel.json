@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "npm ci --omit=dev",
+  "buildCommand": "node scripts/verify-build.js",
+  "functions": {
+    "api/index.js": {
+      "runtime": "@vercel/node@5.1.0",
+      "maxDuration": 60,
+      "memory": 1024
+    }
+  },
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index.js" }
+  ],
+  "crons": [
+    { "path": "/api/cron/jobs", "schedule": "*/15 * * * *" }
+  ]
+}

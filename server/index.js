@@ -1,181 +1,90 @@
 'use strict';
 
+/**
+ * Long-running server entry point.
+ *
+ * The request handling itself lives in server/app.js so the identical code
+ * runs on Vercel (api/index.js). This file only owns the process: binding a
+ * port, ticking the scheduler and shutting down cleanly.
+ */
+
 const http = require('node:http');
-const fs = require('node:fs');
-const path = require('node:path');
+const app = require('./app');
+const db = require('./db');
 
-const { seedIfNeeded } = require('./seed');
-seedIfNeeded();
-
-const { ApiError } = require('./util');
-const { Router, HANDLED, readJsonBody } = require('./router');
-const { getSessionUser } = require('./auth');
-const { startScheduler } = require('./reminders');
-
-const router = new Router();
-require('./routes/auth.routes').register(router);
-require('./routes/broker.routes').register(router);
-require('./routes/client.routes').register(router);
-require('./routes/settings.routes').register(router);
-
-const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const PORT = Number(process.env.PORT) || 3000;
 
-const STATIC_TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-};
-
-function parseCookies(header) {
-  const out = {};
-  for (const part of String(header || '').split(';')) {
-    const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
-  }
-  return out;
-}
-
-function securityHeaders(res) {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Referrer-Policy', 'same-origin');
-  res.setHeader(
-    'Content-Security-Policy',
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; object-src 'self'; frame-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
-  );
-}
-
-function sendJson(res, status, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(body);
-}
-
-function serveFile(res, filePath) {
-  const ext = path.extname(filePath);
-  res.writeHead(200, {
-    'Content-Type': STATIC_TYPES[ext] || 'application/octet-stream',
-    'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=300',
+const server = http.createServer((req, res) => {
+  app.handle(req, res).catch((err) => {
+    console.error('[fatal] unhandled request error:', err);
+    if (!res.writableEnded) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end('{"ok":false,"code":"server_error","message":"Something went wrong on our side."}');
+    }
   });
-  fs.createReadStream(filePath).pipe(res);
-}
-
-/** SPA page routing: pretty URLs → the right portal's index.html. */
-function resolvePage(pathname) {
-  if (
-    pathname === '/' || pathname === '/login' || pathname === '/activate' ||
-    pathname === '/reset' || pathname === '/change-password'
-  ) {
-    return path.join(PUBLIC_DIR, 'login.html');
-  }
-  if (pathname === '/broker' || pathname.startsWith('/broker/')) {
-    return path.join(PUBLIC_DIR, 'broker', 'index.html');
-  }
-  if (pathname === '/portal' || pathname.startsWith('/portal/')) {
-    return path.join(PUBLIC_DIR, 'portal', 'index.html');
-  }
-  return null;
-}
-
-const server = http.createServer(async (req, res) => {
-  securityHeaders(res);
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const pathname = url.pathname;
-
-  const ctx = {
-    req,
-    res,
-    query: Object.fromEntries(url.searchParams),
-    params: {},
-    body: null,
-    user: null,
-    session: null,
-    sessionToken: null,
-    status: 200,
-    ip: (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '',
-    isSecure: req.headers['x-forwarded-proto'] === 'https' || process.env.FORCE_SECURE_COOKIES === '1',
-    HANDLED,
-  };
-
-  try {
-    // Session
-    const cookies = parseCookies(req.headers.cookie);
-    ctx.sessionToken = cookies.sid || null;
-    const auth = getSessionUser(ctx.sessionToken);
-    if (auth) {
-      ctx.user = auth.user;
-      ctx.session = auth.session;
-    }
-
-    // API
-    if (pathname.startsWith('/api/')) {
-      const match = router.match(req.method, pathname);
-      if (!match) throw new ApiError(404, 'Not found.', 'not_found');
-      ctx.params = match.params;
-
-      if (!['GET', 'HEAD'].includes(req.method)) {
-        // CSRF: cross-site form posts can't set custom headers; our frontend always does.
-        if (req.headers['x-requested-with'] !== 'fetch') {
-          throw new ApiError(403, 'Bad request origin.', 'csrf');
-        }
-        if (!match.route.rawBody) ctx.body = await readJsonBody(req);
-      }
-
-      let result;
-      for (const handler of match.route.handlers) {
-        result = await handler(ctx);
-      }
-      if (result === HANDLED) return;
-      sendJson(res, ctx.status, result === undefined ? { ok: true } : result);
-      return;
-    }
-
-    if (pathname === '/health') {
-      sendJson(res, 200, { ok: true, uptime: Math.round(process.uptime()) });
-      return;
-    }
-
-    // Static assets (safe-join inside public/)
-    const assetPath = path.normalize(path.join(PUBLIC_DIR, pathname));
-    if (
-      assetPath.startsWith(PUBLIC_DIR + path.sep) &&
-      path.extname(assetPath) &&
-      fs.existsSync(assetPath) &&
-      fs.statSync(assetPath).isFile()
-    ) {
-      serveFile(res, assetPath);
-      return;
-    }
-
-    // SPA pages
-    const page = resolvePage(pathname);
-    if (page && fs.existsSync(page)) {
-      serveFile(res, page);
-      return;
-    }
-
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Page not found.');
-  } catch (err) {
-    if (err instanceof ApiError) {
-      sendJson(res, err.status, { ok: false, code: err.code, message: err.message });
-      return;
-    }
-    console.error(`[error] ${req.method} ${pathname}:`, err);
-    sendJson(res, 500, {
-      ok: false,
-      code: 'server_error',
-      message: 'Something went wrong on our side. Please try again in a moment.',
-    });
-  }
 });
 
-if (require.main === module) {
+// Slowloris protection: a client that opens a socket and never finishes its
+// headers must not hold a connection open indefinitely.
+// A port that is already taken, or a permission problem, should be one clear
+// line — not an unhandled 'error' event and a stack trace.
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[startup] port ${PORT} is already in use. Stop the other process, or set PORT to something else.`);
+  } else if (err.code === 'EACCES') {
+    console.error(`[startup] not permitted to bind port ${PORT}. Use a port above 1024, or grant the capability.`);
+  } else {
+    console.error('[startup] could not start the server:', err.message);
+  }
+  process.exit(1);
+});
+
+server.headersTimeout = 20000;
+server.requestTimeout = 120000;
+server.keepAliveTimeout = 15000;
+
+/**
+ * Graceful shutdown (audit finding H10).
+ *
+ * A SIGTERM mid-upload previously killed the process instantly, which could
+ * leave a document written to disk with no database row. Now: stop accepting
+ * connections, let in-flight requests finish, stop the scheduler, close the
+ * pool — with a hard deadline so a stuck request cannot block the deploy.
+ */
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} received — finishing in-flight requests.`);
+
+  const deadline = setTimeout(() => {
+    console.error('[shutdown] timed out after 25s — exiting.');
+    process.exit(1);
+  }, 25000);
+  deadline.unref();
+
+  try {
+    require('./jobs').stopScheduler();
+    await new Promise((resolve) => server.close(resolve));
+    await db.close();
+    console.log('[shutdown] clean.');
+    clearTimeout(deadline);
+    process.exit(0);
+  } catch (err) {
+    console.error('[shutdown] error:', err);
+    process.exit(1);
+  }
+}
+
+async function main() {
+  try {
+    await app.ready();
+  } catch (err) {
+    console.error('[startup] refusing to start:', err.message);
+    process.exit(1);
+  }
+
   // Bind explicitly to all IPv4 interfaces: Node's default (host omitted)
   // binds IPv6-only, which the Codespaces/devcontainer port-forwarding
   // proxy cannot reach — that shows up to users as a 502.
@@ -184,7 +93,23 @@ if (require.main === module) {
     console.log(`  Broker portal:  http://localhost:${PORT}/broker`);
     console.log(`  Client portal:  http://localhost:${PORT}/portal`);
   });
-  startScheduler();
+
+  if (process.env.DISABLE_SCHEDULER !== '1') {
+    require('./jobs').startScheduler();
+  }
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('unhandledRejection', (err) => {
+    console.error('[unhandledRejection]', err);
+    require('./sentry').captureException(err instanceof Error ? err : new Error(String(err)), {
+      request: { method: 'internal', path: 'unhandledRejection' },
+    });
+  });
 }
 
-module.exports = { server };
+if (require.main === module) {
+  main();
+}
+
+module.exports = { server, app };

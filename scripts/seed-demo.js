@@ -2,51 +2,30 @@
 
 /**
  * Seeds a demo dataset so the portals have something to show.
+ *
  * Run:  npm run seed:demo
- * Then: npm start  and sign in as the printed accounts.
+ * Then: npm start, and sign in with the accounts printed at the end.
+ *
+ * Demo data is never seeded into a production database, and this script
+ * invents no administrator credentials — ADMIN_EMAIL/ADMIN_PASSWORD must come
+ * from the environment (audit finding C4). Client portal passwords are
+ * generated randomly and printed once.
  */
 
-process.env.NODE_ENV = process.env.NODE_ENV || 'development';
-process.env.ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@example.com';
-process.env.ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin1234';
-process.env.EMAIL_TRANSPORT = 'disabled';
+const crypto = require('node:crypto');
+const demo = require('./demo-lib');
 
-const { server } = require('../server/index');
+process.env.NODE_ENV = process.env.NODE_ENV || 'development';
+demo.guardEnvironment('seed demo data');
+process.env.EMAIL_TRANSPORT = process.env.EMAIL_TRANSPORT || 'disabled';
 
 const PDF = Buffer.from('%PDF-1.4\n1 0 obj <<>> endobj\ntrailer <<>>\n%%EOF\n');
 
 async function main() {
-  await new Promise((resolve) => server.listen(0, resolve));
-  const base = `http://localhost:${server.address().port}`;
-  let cookie = null;
-
-  async function call(method, url, body, raw, filename) {
-    const headers = { 'X-Requested-With': 'fetch' };
-    if (cookie) headers.Cookie = cookie;
-    let payload;
-    if (raw) {
-      headers['Content-Type'] = 'application/octet-stream';
-      headers['X-Filename'] = encodeURIComponent(filename);
-      payload = raw;
-    } else if (body !== undefined) {
-      headers['Content-Type'] = 'application/json';
-      payload = JSON.stringify(body);
-    }
-    const res = await fetch(base + url, { method, headers, body: payload });
-    const setCookie = res.headers.get('set-cookie');
-    if (setCookie) cookie = setCookie.split(';')[0];
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`${method} ${url} → ${res.status}: ${data.message}`);
-    return data;
-  }
-
-  const login = await call('POST', '/api/auth/login', {
-    email: process.env.ADMIN_EMAIL, password: process.env.ADMIN_PASSWORD,
-  }).catch(() => null);
-  if (!login) {
-    console.error('Could not sign in as admin. If this is not a fresh database, set ADMIN_EMAIL/ADMIN_PASSWORD.');
-    process.exit(1);
-  }
+  const { server, base } = await demo.start();
+  const admin = await demo.signInAdmin(base);
+  const call = (method, url, body, raw, filename) =>
+    admin.call(method, url, raw !== undefined ? { raw, filename } : { body });
 
   const meta = await call('GET', '/api/settings/meta');
   const typeByKey = (k) => meta.application_types.find((t) => t.key === k);
@@ -55,19 +34,25 @@ async function main() {
   if (existing.total > 0) {
     console.log('Database already has clients — demo seed skipped.');
     server.close();
+    await require('../server/db').close();
     return;
   }
 
   console.log('Seeding demo data…');
-  const clientPassword = 'Demo1234pass';
-  const activate = async (link) => {
-    const token = new URL(link).searchParams.get('token');
-    const saved = cookie;
-    cookie = null;
-    await call('POST', '/api/auth/activate', { token, password: clientPassword });
-    const clientCookie = cookie;
-    cookie = saved;
-    return clientCookie;
+  const clientPassword = process.env.DEMO_CLIENT_PASSWORD
+    || `Portal-${crypto.randomBytes(9).toString('base64url')}`;
+  /**
+   * Take a freshly created portal account through its first sign-in: the
+   * temporary password is single-use, exactly as it is for a real client.
+   * Returns a client bound to that portal user.
+   */
+  const activate = async (invite) => {
+    const portal = demo.makeClient(base);
+    await portal.post('/api/auth/login', { email: invite.username, password: invite.temporary_password });
+    await portal.post('/api/auth/change-password', {
+      current_password: invite.temporary_password, new_password: clientPassword,
+    });
+    return portal;
   };
 
   // --- John Smith: mid-flight purchase with documents in every state -------
@@ -83,18 +68,14 @@ async function main() {
       property_type: 'Detached', closing_date: new Date(Date.now() + 40 * 86400000).toISOString().slice(0, 10),
     },
   });
-  const johnCookie = await activate(john.invites[0].activation_link);
+  const johnPortal = await activate(john.invites[0]);
   const johnDocs = await call('GET', `/api/broker/files/${john.file.id}/documents`);
   const johnReq = (n) => johnDocs.requests.find((r) => r.document_name === n);
 
   // Client uploads a few documents.
-  const asJohn = async (method, url, body, raw, filename) => {
-    const saved = cookie;
-    cookie = johnCookie;
-    const out = await call(method, url, body, raw, filename);
-    cookie = saved;
-    return out;
-  };
+  const asJohn = (method, url, body, raw, filename) =>
+    johnPortal.call(method, url, raw !== undefined ? { raw, filename } : { body });
+
   for (const n of ['T4', 'Recent Pay Stub', 'Employment Letter']) {
     await asJohn('POST', `/api/client/requests/${johnReq(n).id}/upload`, undefined, PDF, `${n.replace(/ /g, '_')}.pdf`);
   }
@@ -121,7 +102,7 @@ async function main() {
       email: 'michael.demo@example.com', employment_type: 'employee', employer_name: 'Halton School Board',
     }],
   });
-  await activate(sarah.invites[0].activation_link);
+  await activate(sarah.invites[0]);
   await call('POST', `/api/broker/files/${sarah.file.id}/stage`, { stage_id: stageByKey('application_started').id });
   const today = new Date().toISOString().slice(0, 10);
   await call('POST', '/api/broker/tasks', {
@@ -141,7 +122,7 @@ async function main() {
     },
     send_welcome: true,
   });
-  await activate(david.invites[0].activation_link);
+  await activate(david.invites[0]);
   const davidDocs = await call('GET', `/api/broker/files/${david.file.id}/documents`);
   for (const r of davidDocs.requests.filter((x) => x.requirement === 'required')) {
     await call('POST', `/api/broker/requests/${r.id}/upload`, undefined, PDF, `${r.document_name.replace(/ /g, '_')}.pdf`);
@@ -155,15 +136,18 @@ async function main() {
 
   console.log('----------------------------------------------------------');
   console.log('Demo data ready. Accounts:');
-  console.log(`  Broker portal (/broker):  ${process.env.ADMIN_EMAIL} / ${process.env.ADMIN_PASSWORD}`);
+  console.log(`  Broker portal (/broker):  ${admin.email} / ${admin.password}`);
+  console.log('    (plus the two-step code from the authenticator entry printed above)');
   console.log(`  Client portal (/portal):  john.demo@example.com / ${clientPassword}`);
   console.log(`                            sarah.demo@example.com / ${clientPassword}`);
   console.log(`                            david.demo@example.com / ${clientPassword}`);
   console.log('----------------------------------------------------------');
   server.close();
+  await require('../server/db').close();
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('Seed failed:', err.message);
+  await require('../server/db').close().catch(() => {});
   process.exit(1);
 });

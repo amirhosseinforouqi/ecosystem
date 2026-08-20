@@ -1,39 +1,77 @@
 'use strict';
 
 /**
- * Resets local data to a clean "broker only" state: brokerage settings,
- * stages, application types, document rules and email templates are all
- * seeded as usual, and a single admin account is created — but there are
- * ZERO clients. Useful for a live, step-by-step walkthrough of the
- * "create a client" flow from an empty dashboard.
+ * Reset to a clean "broker only" state: brokerage settings, stages,
+ * application types, document rules and email templates are seeded as usual,
+ * and a single administrator account exists — but there are ZERO clients.
+ * Useful for a live, step-by-step walkthrough of the "create a client" flow
+ * from an empty dashboard.
  *
- * This DELETES the existing local database and any uploaded files in
- * DATA_DIR (default ./data) — including any clients from `npm run
- * seed:demo`. Nothing outside DATA_DIR is touched. Run `npm run seed:demo`
- * afterwards any time to bring the full sample dataset back.
+ * DESTRUCTIVE: this drops every row in the application's own tables and
+ * deletes the uploaded documents in DATA_DIR. It refuses to run against a
+ * production environment.
  *
  * Run:  npm run reset:broker-only
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
+const demo = require('./demo-lib');
+
+process.env.NODE_ENV = process.env.NODE_ENV || 'development';
+demo.guardEnvironment('reset the database');
+
+if (!process.argv.includes('--confirm')) {
+  console.error(
+    'Refusing to reset without --confirm.\n' +
+    '  npm run reset:broker-only -- --confirm\n' +
+    'This deletes every client, document and message in ' + (process.env.DATABASE_URL || '').replace(/:[^:@/]*@/, ':****@')
+  );
+  process.exit(1);
+}
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 
-process.env.ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@example.com';
-process.env.ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin1234';
+async function main() {
+  const db = require('../server/db');
+  await db.migrate();
 
-console.log(`Resetting ${DATA_DIR} — this removes any existing clients, documents and messages.`);
-fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  // Delete children before parents; settings, stages, rules and templates are
+  // left in place so the brokerage's configuration survives the reset.
+  const TABLES = [
+    'ai_reviews', 'document_versions', 'document_requests', 'checklist_exclusions',
+    'consents', 'stage_history', 'activity_log', 'notes', 'tasks', 'messages',
+    'notifications', 'email_log', 'applicants', 'client_files',
+    'sessions', 'auth_tokens', 'login_attempts', 'rate_limits', 'mfa_recovery_codes',
+  ];
+  await db.tx(async () => {
+    for (const table of TABLES) await db.run(`DELETE FROM ${table}`);
+    // Client portal accounts belong to the deleted files; staff accounts stay.
+    await db.run("DELETE FROM users WHERE role = 'client'");
+    // Everyone must sign in again, and staff must re-enrol their second factor.
+    await db.run('UPDATE users SET mfa_secret = NULL, mfa_enrolled_at = NULL, mfa_last_used_step = NULL');
+    await db.run("DELETE FROM counters WHERE key LIKE 'file:%'");
+  });
 
-// Loading the server module seeds settings, stages, application types,
-// document rules, email templates and the admin account as a side effect.
-// It does not start listening or create any clients — that only happens
-// when the module is run directly (`npm start`), not required like this.
-require('../server/index.js');
+  fs.rmSync(path.join(DATA_DIR, 'uploads'), { recursive: true, force: true });
 
-console.log('----------------------------------------------------------');
-console.log('Broker-only demo ready — zero clients, ready for a live walkthrough.');
-console.log(`  Broker portal (/broker): ${process.env.ADMIN_EMAIL} / ${process.env.ADMIN_PASSWORD}`);
-console.log('Run "npm start" now, then sign in and try "+ New client".');
-console.log('----------------------------------------------------------');
+  const { server, base } = await demo.start();
+  const admin = await demo.signInAdmin(base);
+  const clients = await admin.get('/api/broker/clients?status=all');
+
+  console.log('----------------------------------------------------------');
+  console.log(`Broker-only state ready — ${clients.total} clients.`);
+  console.log(`  Broker portal (/broker): ${admin.email} / ${admin.password}`);
+  console.log('  Plus the two-step code from the authenticator entry above.');
+  console.log('Run "npm start", sign in, and try "+ New client".');
+  console.log('----------------------------------------------------------');
+
+  server.close();
+  await db.close();
+}
+
+main().catch(async (err) => {
+  console.error('Reset failed:', err.message);
+  await require('../server/db').close().catch(() => {});
+  process.exit(1);
+});

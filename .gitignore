@@ -1,5 +1,8 @@
 node_modules/
 data/
+backups/
 *.log
 .DS_Store
 .env
+.env.local
+.devcontainer/.env.local

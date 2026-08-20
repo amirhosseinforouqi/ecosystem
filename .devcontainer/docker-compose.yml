@@ -1,0 +1,33 @@
+# Two containers: the app and a real PostgreSQL 16 server. The application
+# requires PostgreSQL — there is no embedded-database fallback — so the demo
+# environment runs the same engine production does.
+services:
+  app:
+    image: mcr.microsoft.com/devcontainers/javascript-node:22
+    command: sleep infinity
+    volumes:
+      - ..:/workspaces/mortgage-client-platform:cached
+    environment:
+      DATABASE_URL: postgres://mortgage:mortgage@db:5432/mortgage
+      PGSSLMODE: disable
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mortgage
+      POSTGRES_PASSWORD: mortgage
+      POSTGRES_DB: mortgage
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mortgage -d mortgage"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:

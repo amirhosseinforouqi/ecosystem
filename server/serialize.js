@@ -1,7 +1,7 @@
 'use strict';
 
 const { get, all } = require('./db');
-const { fullName } = require('./util');
+const { fullName, parseJsonSafe } = require('./util');
 
 function publicUser(user) {
   if (!user) return null;
@@ -15,6 +15,7 @@ function publicUser(user) {
     status: user.status,
     last_login_at: user.last_login_at,
     created_at: user.created_at,
+    mfa_enrolled: !!user.mfa_enrolled_at,
   };
 }
 
@@ -40,6 +41,7 @@ function applicantSummary(a) {
     employment_notes: a.employment_notes,
     has_portal_access: !!a.portal_user_id,
     portal_user_id: a.portal_user_id,
+    shares_documents: a.shares_documents === 1,
   };
 }
 
@@ -74,21 +76,30 @@ function clientDocStatus(request, currentVersion) {
   }
 }
 
-/** Full document request row with type/applicant context and versions. */
-function requestFull(requestId, { includeInternal = false } = {}) {
-  const r = get(
+/**
+ * Serialize a document request.
+ *
+ * Two strictly separate shapes:
+ *  - client shape (default): friendly status, no internal notes, no AI
+ *    output, no storage locations, no scan detail.
+ *  - broker shape (includeInternal): adds internal notes, version history,
+ *    AI review, OneDrive location and scan state.
+ *
+ * `canDownload` controls only whether the response advertises byte access —
+ * the actual bytes are gated server-side in the route (audit finding H6).
+ */
+async function requestFull(requestId, { includeInternal = false, canDownload = false } = {}) {
+  const r = await get(
     `SELECT r.*, dt.name AS document_name, dt.category AS document_category, dt.description AS document_description
        FROM document_requests r JOIN document_types dt ON dt.id = r.document_type_id
       WHERE r.id = ?`,
     requestId
   );
   if (!r) return null;
-  const applicant = r.applicant_id ? get('SELECT * FROM applicants WHERE id = ?', r.applicant_id) : null;
-  const versions = all(
-    'SELECT * FROM document_versions WHERE request_id = ? ORDER BY version DESC',
-    requestId
-  );
+  const applicant = r.applicant_id ? await get('SELECT * FROM applicants WHERE id = ?', r.applicant_id) : null;
+  const versions = await all('SELECT * FROM document_versions WHERE request_id = ? ORDER BY version DESC', requestId);
   const current = versions.find((v) => v.id === r.current_version_id) || versions[0] || null;
+  const scan = require('./scan');
 
   const base = {
     id: r.id,
@@ -115,17 +126,18 @@ function requestFull(requestId, { includeInternal = false } = {}) {
           original_name: current.original_name,
           display_name: current.display_name || current.original_name,
           mime: current.mime,
-          size: current.size,
+          size: Number(current.size),
           status: current.status,
           uploaded_at: current.uploaded_at,
           review_note_client: current.review_note_client,
+          // Advisory only; the route enforces it.
+          available: scan.isServable(current),
+          can_download: canDownload && scan.isServable(current),
         }
       : null,
   };
 
   if (includeInternal) {
-    // Brokerage-only fields. The client-facing branch above deliberately
-    // omits internal notes, AI review output and storage locations.
     const { reviewForVersion } = require('./ai-review');
     base.internal_note = r.internal_note;
     base.source = r.source;
@@ -133,34 +145,71 @@ function requestFull(requestId, { includeInternal = false } = {}) {
     base.reminder_count = r.reminder_count;
     base.last_reminder_at = r.last_reminder_at;
     base.expires_days = r.expires_days;
-    base.versions = versions.map((v) => ({
-      id: v.id,
-      version: v.version,
-      original_name: v.original_name,
-      display_name: v.display_name || v.original_name,
-      mime: v.mime,
-      size: v.size,
-      status: v.status,
-      uploaded_at: v.uploaded_at,
-      uploaded_by: v.uploaded_by,
-      reviewed_at: v.reviewed_at,
-      review_note_client: v.review_note_client,
-      review_note_internal: v.review_note_internal,
-      onedrive_status: v.onedrive_status,
-      onedrive_path: v.onedrive_path,
-      onedrive_item_id: v.onedrive_item_id,
-      onedrive_error: v.onedrive_error,
-      ai_review: reviewForVersion(v.id),
-    }));
-    base.ai_review = current ? reviewForVersion(current.id) : null;
+    base.versions = [];
+    for (const v of versions) {
+      base.versions.push({
+        id: v.id,
+        version: v.version,
+        original_name: v.original_name,
+        display_name: v.display_name || v.original_name,
+        mime: v.mime,
+        size: Number(v.size),
+        status: v.status,
+        uploaded_at: v.uploaded_at,
+        uploaded_by: v.uploaded_by,
+        reviewed_at: v.reviewed_at,
+        review_note_client: v.review_note_client,
+        review_note_internal: v.review_note_internal,
+        scan_status: v.scan_status,
+        scan_result: v.scan_result,
+        onedrive_status: v.onedrive_status,
+        onedrive_path: v.onedrive_path,
+        onedrive_item_id: v.onedrive_item_id,
+        onedrive_error: v.onedrive_error,
+        encrypted: !!v.enc_envelope,
+        can_download: canDownload && scan.isServable(v),
+        ai_review: await reviewForVersion(v.id),
+      });
+    }
+    base.ai_review = current ? await reviewForVersion(current.id) : null;
   }
   return base;
 }
 
-function fileRequests(fileId, opts) {
-  return all('SELECT id FROM document_requests WHERE file_id = ? ORDER BY id', fileId)
-    .map((row) => requestFull(row.id, opts))
-    .filter(Boolean);
+/** All requests on a file, in the broker shape. */
+async function fileRequests(fileId, opts) {
+  const rows = await all('SELECT id FROM document_requests WHERE file_id = ? ORDER BY id', fileId);
+  const out = [];
+  for (const row of rows) {
+    const full = await requestFull(row.id, opts);
+    if (full) out.push(full);
+  }
+  return out;
+}
+
+/**
+ * Requests visible to a client portal user on a file, scoped to the
+ * applicants whose documents they may see (audit finding H3).
+ */
+async function clientFileRequests(fileId, visibleApplicantIds) {
+  const ids = [...visibleApplicantIds];
+  const rows = ids.length
+    ? await all(
+        `SELECT id FROM document_requests
+          WHERE file_id = ? AND (applicant_id IS NULL OR applicant_id = ANY(?::int[]))
+          ORDER BY id`,
+        fileId, ids
+      )
+    : await all(
+        'SELECT id FROM document_requests WHERE file_id = ? AND applicant_id IS NULL ORDER BY id',
+        fileId
+      );
+  const out = [];
+  for (const row of rows) {
+    const full = await requestFull(row.id, { includeInternal: false, canDownload: true });
+    if (full && full.status !== 'waived') out.push(full);
+  }
+  return out;
 }
 
 function messageRow(m) {
@@ -178,4 +227,12 @@ function messageRow(m) {
   };
 }
 
-module.exports = { publicUser, applicantSummary, clientDocStatus, requestFull, fileRequests, messageRow };
+module.exports = {
+  publicUser,
+  applicantSummary,
+  clientDocStatus,
+  requestFull,
+  fileRequests,
+  clientFileRequests,
+  messageRow,
+};

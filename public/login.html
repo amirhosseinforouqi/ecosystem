@@ -15,6 +15,20 @@
     }
     .auth-title { text-align: center; margin-bottom: 4px; }
     .auth-sub { text-align: center; color: var(--ink-soft); margin-bottom: 22px; }
+    .auth-card { max-width: 440px; }
+    .setup-steps { margin: 0 0 18px; padding-left: 20px; color: var(--ink-soft); font-size: 0.92rem; line-height: 1.7; }
+    .setup-steps li { margin-bottom: 6px; }
+    .mfa-secret {
+      display: inline-block; font-size: 1.02rem; letter-spacing: 0.08em; font-weight: 700;
+      background: var(--bg); color: var(--ink); padding: 3px 8px; border-radius: 6px;
+      user-select: all; word-break: break-all;
+    }
+    .recovery-codes {
+      list-style: none; margin: 0 0 20px; padding: 14px; border-radius: 10px;
+      background: var(--bg);
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 14px;
+    }
+    .recovery-codes code { font-size: 0.95rem; letter-spacing: 0.04em; user-select: all; }
   </style>
 </head>
 <body>

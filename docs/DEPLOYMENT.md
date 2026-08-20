@@ -244,6 +244,15 @@ CI: back up, wipe, restore, verify the documents still decrypt.
 Retention: `BACKUP_RETENTION_DAYS` (default 30) and `BACKUP_KEEP_MIN`
 (default 7).
 
+### Record retention
+
+Separately from backups, **Settings → Retention** can archive files
+automatically: `archive_completed_after_days` and
+`archive_inactive_after_days`. Both are off until you set them, and both
+*archive* — nothing is ever deleted automatically, because deleting a mortgage
+file on a timer would breach most brokerages' record-keeping obligations. Set
+these to match your own legal advice.
+
 ---
 
 ## 10. Go-live checklist

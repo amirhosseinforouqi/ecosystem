@@ -1311,9 +1311,15 @@ function register(router) {
       'Content-Disposition': `${wantsDownload ? 'attachment' : 'inline'}; filename="${(version.display_name || version.original_name).replace(/[^\w.\- ]/g, '_')}"`,
       'Cache-Control': 'private, no-store',
       'X-Content-Type-Options': 'nosniff',
+      // The application-wide DENY is correct for pages, but this response is
+      // framed by our own preview modal. Framing is still restricted to this
+      // origin, and the document itself is sandboxed.
+      'X-Frame-Options': 'SAMEORIGIN',
       // A malicious PDF/SVG rendered inline must not be able to reach back
       // into the application origin.
-      'Content-Security-Policy': "default-src 'none'; object-src 'none'; script-src 'none'; sandbox",
+      'Content-Security-Policy':
+        "default-src 'none'; object-src 'none'; script-src 'none'; " +
+        "frame-ancestors 'self'; sandbox",
     });
     ctx.res.end(bytes);
     return HANDLED;

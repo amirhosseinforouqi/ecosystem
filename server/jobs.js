@@ -177,6 +177,54 @@ async function scanPass() {
 }
 
 /** Housekeeping: expired sessions, stale rate-limit buckets, old attempts. */
+/**
+ * Apply the brokerage's retention policy.
+ *
+ * Files are *archived*, never deleted — that is what the policy note in
+ * Settings promises, and deleting a mortgage file automatically would be
+ * wrong under most brokerages' record-keeping obligations. Both windows are
+ * off (null) until an administrator sets them.
+ */
+async function retentionPass() {
+  const cfg = await getSetting('retention', {});
+  const completedDays = Number(cfg.archive_completed_after_days) || null;
+  const inactiveDays = Number(cfg.archive_inactive_after_days) || null;
+  if (!completedDays && !inactiveDays) return;
+
+  const archive = async (rows, reason) => {
+    for (const file of rows) {
+      await run("UPDATE client_files SET status = 'archived', updated_at = ? WHERE id = ?", now(), file.id);
+      await activity(file.id, null, 'status_changed', `File archived automatically — ${reason}`);
+    }
+  };
+
+  if (completedDays) {
+    const cutoff = new Date(Date.now() - completedDays * 86400000).toISOString();
+    // "Completed" means the file reached a terminal stage; the clock runs from
+    // when it last saw activity, not from when it was created.
+    const rows = await all(
+      `SELECT f.id FROM client_files f
+         JOIN stages s ON s.id = f.stage_id
+        WHERE f.status = 'completed' AND s.is_terminal = 1
+          AND COALESCE(f.last_activity_at, f.updated_at) < ?
+        LIMIT 200`,
+      cutoff
+    );
+    await archive(rows, `completed and untouched for ${completedDays} days`);
+  }
+
+  if (inactiveDays) {
+    const cutoff = new Date(Date.now() - inactiveDays * 86400000).toISOString();
+    const rows = await all(
+      `SELECT id FROM client_files
+        WHERE status = 'active' AND COALESCE(last_activity_at, updated_at) < ?
+        LIMIT 200`,
+      cutoff
+    );
+    await archive(rows, `no activity for ${inactiveDays} days`);
+  }
+}
+
 async function maintenancePass() {
   const auth = require('./auth');
   const ratelimit = require('./ratelimit');
@@ -192,6 +240,7 @@ const PASSES = [
   ['scan', scanPass],
   ['ai-review', () => require('./ai-review').processAiReviews()],
   ['onedrive', () => require('./onedrive').processOneDriveSync()],
+  ['retention', retentionPass],
   ['maintenance', maintenancePass],
 ];
 
@@ -263,5 +312,6 @@ module.exports = {
   runReminderPass,
   runExpiryPass,
   scanPass,
+  retentionPass,
   maintenancePass,
 };

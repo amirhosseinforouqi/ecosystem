@@ -191,7 +191,13 @@ function register(router) {
       'Content-Disposition': `inline; filename="${String(version.original_name).replace(/[^\w.\- ]/g, '_')}"`,
       'Cache-Control': 'private, no-store',
       'X-Content-Type-Options': 'nosniff',
-      'Content-Security-Policy': "default-src 'none'; object-src 'none'; script-src 'none'; sandbox",
+      // The application-wide DENY is correct for pages, but this response is
+      // framed by our own preview modal. Framing is still restricted to this
+      // origin, and the document itself is sandboxed.
+      'X-Frame-Options': 'SAMEORIGIN',
+      'Content-Security-Policy':
+        "default-src 'none'; object-src 'none'; script-src 'none'; " +
+        "frame-ancestors 'self'; sandbox",
     });
     ctx.res.end(bytes);
     return HANDLED;

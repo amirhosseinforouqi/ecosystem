@@ -157,11 +157,38 @@ async function createBackup(destRoot, opts = {}) {
   return { dir, manifest };
 }
 
+/**
+ * Table and column names cannot be parameterized, so anything that reaches a
+ * statement as an identifier is checked against the schema this build knows
+ * about. A backup archive is a file an operator can be handed by someone
+ * else; it must not be able to name an arbitrary identifier.
+ */
+const KNOWN_TABLES = new Set(TABLES);
+
+function assertKnownTable(table) {
+  if (!KNOWN_TABLES.has(table)) {
+    throw new Error(`Backup names a table this application does not have: ${JSON.stringify(String(table).slice(0, 60))}.`);
+  }
+  return table;
+}
+
+async function columnsOf(table) {
+  const rows = await db.all(
+    'SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?',
+    table
+  );
+  return new Set(rows.map((r) => r.column_name));
+}
+
 async function readManifest(dir) {
   const manifest = JSON.parse(await fsp.readFile(path.join(dir, 'manifest.json'), 'utf8'));
   if (manifest.format !== 1) {
     throw new Error(`Unsupported backup format ${manifest.format}.`);
   }
+  if (!Array.isArray(manifest.tables)) {
+    throw new Error('Backup manifest has no table list.');
+  }
+  manifest.tables.forEach(assertKnownTable);
   return manifest;
 }
 
@@ -234,8 +261,9 @@ async function restoreBackup(dir, { confirm = false, restoreDocuments = true } =
     }
     for (const table of manifest.tables) {
       const list = byTable.get(table) || [];
+      const known = await columnsOf(table);
       for (const row of list) {
-        const cols = Object.keys(row);
+        const cols = Object.keys(row).filter((c) => known.has(c));
         if (!cols.length) continue;
         const placeholders = cols.map(() => '?').join(', ');
         await db.run(

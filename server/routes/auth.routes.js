@@ -4,7 +4,7 @@ const { run, get, all, getSetting } = require('../db');
 const {
   verifyCredentials, completeLogin, destroySession, createSession, hashPassword, verifyPassword,
   validatePasswordStrength, minPasswordLength, consumeAuthToken, peekAuthToken, createAuthToken,
-  destroyAllSessions, requireAuth, permissionsForRole, STAFF_ROLES,
+  destroyAllSessions, requireAuth, permissionsForRole, sessionCookieMaxAge, STAFF_ROLES,
 } = require('../auth');
 const mfa = require('../mfa');
 const ratelimit = require('../ratelimit');
@@ -17,13 +17,17 @@ const { unreadCount } = require('../notify');
 const COOKIE_NAME = 'sid';
 const MFA_COOKIE = 'mfa';
 
-async function setSessionCookie(ctx, token) {
+/**
+ * Max-Age comes from the same configuration the server enforces, per role, so
+ * a staff cookie is not left valid in the browser for days after the shorter
+ * staff session has already expired server-side.
+ */
+async function setSessionCookie(ctx, token, user) {
   const secure = ctx.isSecure ? '; Secure' : '';
-  const security = await getSetting('security', {});
-  const days = security.session_days_client || 7;
+  const maxAge = await sessionCookieMaxAge(user ? user.role : 'client');
   ctx.res.setHeader(
     'Set-Cookie',
-    `${COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${days * 86400}${secure}`
+    `${COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`
   );
 }
 
@@ -100,7 +104,7 @@ function register(router) {
     }
 
     const token = await completeLogin(user, ctx.ip, ctx.req.headers['user-agent']);
-    await setSessionCookie(ctx, token);
+    await setSessionCookie(ctx, token, user);
     await audit(user.id, 'login', 'user', user.id, ctx.ip, { mfa: false });
     if (user.role === 'client') {
       for (const a of await all('SELECT DISTINCT file_id FROM applicants WHERE portal_user_id = ?', user.id)) {
@@ -135,7 +139,7 @@ function register(router) {
 
     await run('UPDATE auth_tokens SET used_at = ? WHERE id = ?', now(), row.id);
     const token = await completeLogin(user, ctx.ip, ctx.req.headers['user-agent']);
-    await setSessionCookie(ctx, token);
+    await setSessionCookie(ctx, token, user);
     await audit(user.id, 'login', 'user', user.id, ctx.ip, { mfa: true, method: result.method });
     ctx.user = user;
     return {
@@ -235,7 +239,7 @@ function register(router) {
     }
     const fresh = await get('SELECT * FROM users WHERE id = ?', user.id);
     const sessionToken = await completeLogin(fresh, ctx.ip, ctx.req.headers['user-agent']);
-    await setSessionCookie(ctx, sessionToken);
+    await setSessionCookie(ctx, sessionToken, fresh);
     ctx.user = fresh;
     return { ok: true, redirect: await homeFor(fresh), ...(await meProfile(ctx)) };
   });
@@ -312,7 +316,7 @@ function register(router) {
     const wasForced = !!ctx.user.must_change_password;
     await destroyAllSessions(ctx.user.id);
     const token = await createSession(ctx.user.id, ctx.ip, ctx.req.headers['user-agent'], { role: ctx.user.role });
-    await setSessionCookie(ctx, token);
+    await setSessionCookie(ctx, token, ctx.user);
     await audit(ctx.user.id, 'password_changed', 'user', ctx.user.id, ctx.ip, { forced: wasForced });
     if (wasForced) {
       for (const a of await all('SELECT DISTINCT file_id FROM applicants WHERE portal_user_id = ?', ctx.user.id)) {

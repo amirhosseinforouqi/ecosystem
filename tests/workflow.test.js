@@ -381,6 +381,42 @@ describe('housekeeping', () => {
     assert.ok(byAddress.data.results.some((r) => r.id === fileId));
   });
 
+  test('the retention policy archives on the schedule the brokerage sets', async () => {
+    const db = require('../server/db');
+    const jobs = require('../server/jobs');
+
+    // Off by default: nothing is touched.
+    await jobs.retentionPass();
+    const before = await db.get("SELECT COUNT(*)::int AS n FROM client_files WHERE status = 'archived'");
+    assert.equal(before.n, 0);
+
+    // Make one file look long-untouched, then turn the policy on.
+    const old = new Date(Date.now() - 400 * 86400000).toISOString();
+    await db.run('UPDATE client_files SET last_activity_at = ?, updated_at = ? WHERE id = ?', old, old, fileId);
+    assert.equal(
+      (await admin.put('/api/settings/config/retention', { value: { archive_inactive_after_days: 365 } })).status,
+      200
+    );
+    await jobs.retentionPass();
+
+    const file = await db.get('SELECT status FROM client_files WHERE id = ?', fileId);
+    assert.equal(file.status, 'archived', 'an inactive file is archived, not deleted');
+    const activity = await admin.get(`/api/broker/files/${fileId}/activity`);
+    assert.ok(activity.data.activity.some((a) => /archived automatically/i.test(a.message)));
+
+    // Nothing is ever removed by the policy.
+    const stillThere = await admin.get(`/api/broker/files/${fileId}`);
+    assert.equal(stillThere.status, 200);
+
+    await admin.put('/api/settings/config/retention', { value: {} });
+    await admin.post(`/api/broker/files/${fileId}/status`, { status: 'active' });
+  });
+
+  test('an out-of-range retention window is refused', async () => {
+    assert.equal((await admin.put('/api/settings/config/retention', { value: { archive_inactive_after_days: 0 } })).status, 400);
+    assert.equal((await admin.put('/api/settings/config/retention', { value: { archive_inactive_after_days: 99999 } })).status, 400);
+  });
+
   test('reports summarize the book without loading it', async () => {
     const res = await admin.get('/api/broker/reports');
     assert.equal(res.status, 200);

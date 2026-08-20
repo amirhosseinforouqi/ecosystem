@@ -101,6 +101,22 @@ function validateConfig(key, value) {
     };
   }
 
+  if (key === 'retention') {
+    const out = { ...value };
+    for (const field of ['archive_completed_after_days', 'archive_inactive_after_days']) {
+      if (out[field] === undefined || out[field] === null || out[field] === '') {
+        out[field] = null;
+        continue;
+      }
+      const n = intOrNull(out[field]);
+      if (n === null || n < 1 || n > 3650) {
+        throw new ApiError(400, `"${field}" must be a number of days between 1 and 3650, or empty to leave it off.`, 'bad_value');
+      }
+      out[field] = n;
+    }
+    return out;
+  }
+
   if (key === 'uploads') {
     const out = { ...value };
     if (out.max_mb !== undefined) {
@@ -166,8 +182,13 @@ function register(router) {
     return { ok: true };
   });
 
+  // Table names cannot be parameterized, so the only ones reorder() will
+  // accept are named here — never anything derived from a request.
+  const REORDERABLE = new Set(['stages', 'application_types', 'employment_statuses', 'document_types']);
+
   /** Shared reorder helper — one statement per table, ids validated. */
   async function reorder(table, rawIds) {
+    if (!REORDERABLE.has(table)) throw new ApiError(400, 'That list cannot be reordered.', 'bad_table');
     const ids = (Array.isArray(rawIds) ? rawIds : []).slice(0, 500)
       .map((v) => intOrNull(v)).filter((v) => v !== null);
     for (let i = 0; i < ids.length; i++) {

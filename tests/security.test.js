@@ -264,7 +264,21 @@ describe('role permissions (audit finding H6)', () => {
     const res = await admin.get(`/api/broker/versions/${aliceVersionId}/file`);
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(res.headers.get('cache-control'), 'private, no-store');
+    const csp = res.headers.get('content-security-policy');
+    assert.match(csp, /sandbox/, 'the document runs with no privileges of its own');
+    assert.match(csp, /script-src 'none'/);
+    assert.match(csp, /frame-ancestors 'self'/, 'framable by this app, by nobody else');
+    // The application-wide DENY would break our own preview modal, so this
+    // response narrows it rather than inheriting it.
+    assert.equal(res.headers.get('x-frame-options'), 'SAMEORIGIN');
+  });
+
+  test('the same headers protect the client portal\'s copy', async () => {
+    const res = await alice.get(`/api/client/versions/${aliceVersionId}/file`);
+    assert.equal(res.status, 200);
     assert.match(res.headers.get('content-security-policy'), /sandbox/);
+    assert.equal(res.headers.get('x-frame-options'), 'SAMEORIGIN');
+    assert.equal(res.headers.get('cache-control'), 'private, no-store');
   });
 
   test('an assistant cannot reach settings, audit or user management', async () => {

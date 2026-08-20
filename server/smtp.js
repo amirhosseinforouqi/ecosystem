@@ -21,6 +21,21 @@ function toBase64(str) {
 }
 
 /** RFC 2047 "encoded word" — only applied when the string isn't plain ASCII. */
+/**
+ * Reject anything that could break out of an SMTP command or a header line.
+ *
+ * Addresses reaching here have already been validated upstream, but header and
+ * command injection is a whole class of bug worth closing at the boundary
+ * rather than trusting every caller forever.
+ */
+function assertAddress(value, what) {
+  const address = String(value || '').trim();
+  if (!/^[^\s<>",;:\\]+@[^\s<>",;:\\]+\.[^\s<>",;:\\]+$/.test(address) || address.length > 254) {
+    throw new Error(`The ${what} address is not a valid email address.`);
+  }
+  return address;
+}
+
 function encodeHeaderValue(str) {
   if (/^[\x20-\x7e]*$/.test(str)) return str;
   return `=?UTF-8?B?${toBase64(str)}?=`;
@@ -141,6 +156,8 @@ function connectTls(host, port, rejectUnauthorized) {
  * @param {string} opts.text
  */
 async function sendMail(opts) {
+  const from = assertAddress(opts.from, 'sender');
+  const to = assertAddress(opts.to, 'recipient');
   const port = opts.port || 587;
   const useImplicitTls = opts.secure ?? port === 465;
   // Real usage always verifies the server certificate; only tests (against
@@ -186,16 +203,16 @@ async function sendMail(opts) {
     writeLine(socket, toBase64(opts.pass));
     await expect(235);
 
-    writeLine(socket, `MAIL FROM:<${opts.from}>`);
+    writeLine(socket, `MAIL FROM:<${from}>`);
     await expect(250);
-    writeLine(socket, `RCPT TO:<${opts.to}>`);
+    writeLine(socket, `RCPT TO:<${to}>`);
     await expect(250, 251);
     writeLine(socket, 'DATA');
     await expect(354);
 
     const headers = [
-      `From: ${opts.fromName ? `${encodeHeaderValue(opts.fromName)} <${opts.from}>` : opts.from}`,
-      `To: ${opts.toName ? `${encodeHeaderValue(opts.toName)} <${opts.to}>` : opts.to}`,
+      `From: ${opts.fromName ? `${encodeHeaderValue(opts.fromName)} <${from}>` : from}`,
+      `To: ${opts.toName ? `${encodeHeaderValue(opts.toName)} <${to}>` : to}`,
       `Subject: ${encodeHeaderValue(opts.subject)}`,
       'MIME-Version: 1.0',
       'Content-Type: text/plain; charset=utf-8',

@@ -145,15 +145,32 @@ async function checkBreachedPassword(password) {
 // ---------------------------------------------------------------------------
 // Sessions
 
+/**
+ * The two lifetimes that bound a session, for one role. Single source of
+ * truth: the cookie's Max-Age is derived from the same numbers the server
+ * enforces, so a browser never holds a cookie the server has already retired.
+ */
+async function sessionLifetimes(role = 'client') {
+  const security = await getSetting('security', {});
+  return {
+    idleDays: role === 'client'
+      ? (security.session_days_client || 7)
+      : (security.session_days_staff || 1),
+    absoluteHours: role === 'client'
+      ? (security.session_absolute_hours_client || 24 * 14)
+      : (security.session_absolute_hours_staff || 12),
+  };
+}
+
+/** Cookie Max-Age in seconds: never longer than the session can actually live. */
+async function sessionCookieMaxAge(role = 'client') {
+  const { idleDays, absoluteHours } = await sessionLifetimes(role);
+  return Math.min(idleDays * 86400, absoluteHours * 3600);
+}
+
 async function createSession(userId, ip, userAgent, { role = 'client' } = {}) {
   const token = randomToken(32);
-  const security = await getSetting('security', {});
-  const idleDays = role === 'client'
-    ? (security.session_days_client || 7)
-    : (security.session_days_staff || 1);
-  const absoluteHours = role === 'client'
-    ? (security.session_absolute_hours_client || 24 * 14)
-    : (security.session_absolute_hours_staff || 12);
+  const { idleDays, absoluteHours } = await sessionLifetimes(role);
 
   await run(
     `INSERT INTO sessions (token_hash, user_id, created_at, expires_at, absolute_expires_at, last_seen_at, ip, user_agent)
@@ -184,7 +201,7 @@ async function getSessionUser(token) {
     const security = await getSetting('security', {});
     const idleDays = user.role === 'client'
       ? (security.session_days_client || 7)
-      : (security.session_days_staff || 1);
+      : (security.session_days_staff || 1); // see sessionLifetimes()
     // Idle window slides; the absolute expiry is deliberately left alone.
     await run(
       'UPDATE sessions SET last_seen_at = ?, expires_at = ? WHERE id = ?',
@@ -452,6 +469,8 @@ module.exports = {
   requirePasswordChanged,
   requireMfaSatisfied,
   createSession,
+  sessionLifetimes,
+  sessionCookieMaxAge,
   getSessionUser,
   destroySession,
   destroyAllSessions,

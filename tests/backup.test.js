@@ -125,6 +125,22 @@ describe('taking a backup', () => {
     const backup = require('../server/backup');
     await assert.rejects(() => backup.restoreBackup(dir, {}), /confirm/i);
   });
+
+  test('an archive naming an unknown table is refused, not executed', async () => {
+    const backup = require('../server/backup');
+    const manifestPath = path.join(dir, 'manifest.json');
+    const original = await fsp.readFile(manifestPath, 'utf8');
+    const manifest = JSON.parse(original);
+    manifest.tables.push('users; DROP TABLE client_files; --');
+    await fsp.writeFile(manifestPath, JSON.stringify(manifest));
+
+    await assert.rejects(
+      () => backup.restoreBackup(dir, { confirm: true }),
+      /does not have/i,
+      'a table name is an identifier and cannot be parameterized, so it must be checked'
+    );
+    await fsp.writeFile(manifestPath, original);
+  });
 });
 
 describe('restoring after total loss', () => {

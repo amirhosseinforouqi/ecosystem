@@ -14,6 +14,6 @@
     { "source": "/(.*)", "destination": "/api/index.js" }
   ],
   "crons": [
-    { "path": "/api/cron/jobs", "schedule": "*/15 * * * *" }
+            { "path": "/api/cron/jobs", "schedule": "0 8 * * *" }
   ]
 }
